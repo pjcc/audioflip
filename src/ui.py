@@ -15,10 +15,12 @@ from typing import TYPE_CHECKING
 from PyQt6.QtCore import (
     Qt,
     QEvent,
+    QObject,
     QPoint,
     QPropertyAnimation,
     QEasingCurve,
     QRectF,
+    QThread,
     QTimer,
     pyqtSignal,
     QSize,
@@ -35,6 +37,7 @@ from PyQt6.QtGui import (
     QPainterPath,
     QPaintEvent,
     QPen,
+    QPixmap,
     QWheelEvent,
 )
 from PyQt6.QtWidgets import (
@@ -53,6 +56,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .audio_manager import AudioDevice, AudioManager, DeviceFlow
+from .bluetooth import bluetooth_connect, bluetooth_disconnect, is_bluetooth_available
 from .config import ConfigManager, VALID_THEMES
 from .icons import ICON_TYPES, IconManager, match_icon_for_name
 
@@ -60,6 +64,38 @@ if TYPE_CHECKING:
     pass
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# BT name-matching helpers
+# ---------------------------------------------------------------------------
+def _bt_name_core(audio_name: str) -> str:
+    """Extract the Bluetooth device name from a Windows audio endpoint name.
+
+    Windows names BT audio endpoints like "Headphones (Buds Pro 2)".
+    The actual BT device name is the part inside the last pair of parentheses.
+    Returns the extracted name lower-cased, or the full name lower-cased
+    if no parentheses are found.
+    """
+    close = audio_name.rfind(")")
+    if close == -1:
+        return audio_name.strip().lower()
+    open_ = audio_name.rfind("(", 0, close)
+    if open_ == -1:
+        return audio_name.strip().lower()
+    return audio_name[open_ + 1:close].strip().lower()
+
+
+def _bt_names_match(name_a: str, name_b: str) -> bool:
+    """Return True if two audio endpoint names refer to the same BT device.
+
+    Compares the core BT device name extracted from each endpoint name.
+    E.g. "Earphones (Buds Pro 2)" and "Headphones (Buds Pro 2)" both match.
+    """
+    core_a = _bt_name_core(name_a)
+    core_b = _bt_name_core(name_b)
+    return core_a == core_b and len(core_a) > 0
+
 
 # ---------------------------------------------------------------------------
 # Win32 constants for always-on-top above taskbar
@@ -236,12 +272,14 @@ class DeviceRow(QWidget):
         icon_mgr: IconManager,
         config_mgr: ConfigManager,
         is_fav: bool = False,
+        disconnected: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.device = device
         self._hovered = False
         self._is_fav = is_fav
+        self._disconnected = disconnected
         self._theme = _t(config_mgr)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedHeight(36)
@@ -250,41 +288,57 @@ class DeviceRow(QWidget):
         layout.setContentsMargins(12, 4, 12, 4)
         layout.setSpacing(8)
 
-        # Star for favourite
+        # Star for favourite — dim colour when disconnected
         self._star = QLabel("\u2605" if is_fav else "")
         self._star.setFixedWidth(14)
+        star_colour = self._theme["fg_dim"] if disconnected else self._theme["accent"]
         self._star.setStyleSheet(
-            f"color: {self._theme['accent']}; font-size: 12px; background: transparent;"
+            f"color: {star_colour}; font-size: 12px; background: transparent;"
         )
         layout.addWidget(self._star)
 
-        # Icon
+        # Icon — draw at 40% opacity when disconnected
         override = config_mgr.get_icon_override(device.id)
         icon_key = override or match_icon_for_name(device.name)
         icon_label = QLabel()
-        icon_label.setPixmap(icon_mgr.get_icon(icon_key, 18).pixmap(QSize(18, 18)))
+        src_pixmap = icon_mgr.get_icon(icon_key, 18).pixmap(QSize(18, 18))
+        if disconnected:
+            faded = QPixmap(src_pixmap.size())
+            faded.fill(Qt.GlobalColor.transparent)
+            p = QPainter(faded)
+            p.setOpacity(0.4)
+            p.drawPixmap(0, 0, src_pixmap)
+            p.end()
+            icon_label.setPixmap(faded)
+        else:
+            icon_label.setPixmap(src_pixmap)
         icon_label.setFixedSize(18, 18)
         layout.addWidget(icon_label)
 
-        # Name
-        name_label = QLabel(device.name)
-        name_label.setFont(QFont(_FONT_FAMILY, 10))
-        name_label.setStyleSheet(
-            f"color: {self._theme['fg']}; background: transparent;"
+        # Name — dim colour when disconnected
+        self._name_label = QLabel(device.name)
+        self._name_label.setFont(QFont(_FONT_FAMILY, 10))
+        name_colour = self._theme["fg_dim"] if disconnected else self._theme["fg"]
+        self._name_label.setStyleSheet(
+            f"color: {name_colour}; background: transparent;"
         )
-        name_label.setSizePolicy(
+        self._name_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
-        layout.addWidget(name_label)
+        layout.addWidget(self._name_label)
 
-        # Checkmark if default
-        if device.is_default:
+        # Checkmark if default (never shown for disconnected)
+        if device.is_default and not disconnected:
             check_label = QLabel()
             check_label.setPixmap(
                 icon_mgr.get_checkmark_icon(14).pixmap(QSize(14, 14))
             )
             check_label.setFixedSize(14, 14)
             layout.addWidget(check_label)
+
+    def set_name_text(self, text: str) -> None:
+        """Update the displayed name (e.g. 'Connecting...')."""
+        self._name_label.setText(text)
 
     def enterEvent(self, event: object) -> None:
         self._hovered = True
@@ -317,6 +371,8 @@ class DeviceDropdown(QWidget):
     """Popup dropdown showing all audio devices grouped by flow."""
 
     device_selected = pyqtSignal(object)  # emits AudioDevice
+    bt_connect_requested = pyqtSignal(object)  # emits AudioDevice — BT connect
+    bt_disconnect_requested = pyqtSignal(object)  # emits AudioDevice — BT disconnect
     favourite_toggled = pyqtSignal(object)  # emits AudioDevice
     closed = pyqtSignal()  # emitted when the dropdown hides
 
@@ -335,6 +391,8 @@ class DeviceDropdown(QWidget):
         self._audio_mgr = audio_mgr
         self._icon_mgr = icon_mgr
         self._config_mgr = config_mgr
+        self._rows_by_device_id: dict[str, DeviceRow] = {}
+        self._bt_busy = False  # True while a BT op is in progress
 
         # Opacity animation
         self._opacity = QGraphicsOpacityEffect(self)
@@ -360,11 +418,13 @@ class DeviceDropdown(QWidget):
     ) -> None:
         for dev in devices:
             row = DeviceRow(
-                dev, self._icon_mgr, self._config_mgr, is_fav=is_fav
+                dev, self._icon_mgr, self._config_mgr,
+                is_fav=is_fav, disconnected=not dev.is_connected,
             )
             row.clicked.connect(self._on_device_clicked)
             row.fav_toggled.connect(self._on_fav_toggled)
             layout.addWidget(row)
+            self._rows_by_device_id[dev.id] = row
 
     def populate_and_show(self, anchor: QPoint, show_mode: str, widget_height: int = 40) -> None:
         """Populate device list and show the dropdown near *anchor*."""
@@ -377,7 +437,67 @@ class DeviceDropdown(QWidget):
             QWidget().setLayout(self.layout())
 
         t = _t(self._config_mgr)
+        self._rows_by_device_id.clear()
         devices = self._audio_mgr.enumerate_devices()
+        active_ids = {d.id for d in devices}
+
+        # Backfill favourite_devices metadata for any active favourite
+        # that was added before the metadata feature existed.
+        fav_metadata = self._config_mgr.get_favourite_devices()
+        for dev in devices:
+            if self._config_mgr.is_favourite(dev.id) and dev.id not in fav_metadata:
+                log.info("Backfilling favourite metadata for '%s'", dev.name)
+                fav_metadata[dev.id] = {
+                    "name": dev.name,
+                    "flow": dev.flow.value,
+                    "is_bluetooth": dev.is_bluetooth,
+                }
+                self._config_mgr.config.favourite_devices[dev.id] = fav_metadata[dev.id]
+                self._config_mgr.save()
+
+        # Reconcile BT endpoint IDs: when a Bluetooth device reconnects it
+        # often gets a new endpoint ID.  Match by extracted BT device name
+        # and migrate the old favourite to the new ID.
+        for dev in list(devices):
+            if not dev.is_bluetooth or self._config_mgr.is_favourite(dev.id):
+                continue  # skip non-BT or already-favourite devices
+            # Look for a disconnected favourite with a matching BT name
+            for fav_id in list(self._config_mgr.config.favourites):
+                if fav_id in active_ids:
+                    continue  # this favourite is still active, skip
+                meta = fav_metadata.get(fav_id)
+                if not meta or not meta.get("is_bluetooth"):
+                    continue
+                if _bt_names_match(dev.name, meta.get("name", "")):
+                    log.info(
+                        "Reconciling BT favourite: '%s' (old ID %s) → '%s' (new ID %s)",
+                        meta.get("name"), fav_id, dev.name, dev.id,
+                    )
+                    self._config_mgr.migrate_favourite_id(fav_id, dev.id, dev.name)
+                    # Update local tracking so ghost logic doesn't re-add
+                    active_ids.add(dev.id)
+                    fav_metadata = self._config_mgr.get_favourite_devices()
+                    break
+
+        # Add ghost entries for disconnected favourites
+        for fav_id in list(self._config_mgr.config.favourites):
+            if fav_id not in active_ids:
+                meta = fav_metadata.get(fav_id)
+                if meta:
+                    ghost = AudioDevice(
+                        id=fav_id,
+                        name=meta.get("name", "Unknown"),
+                        flow=DeviceFlow(meta.get("flow", "output")),
+                        is_default=False,
+                        is_bluetooth=meta.get("is_bluetooth", False),
+                        is_connected=False,
+                    )
+                    devices.append(ghost)
+                    log.debug("Added ghost entry for disconnected favourite: '%s'",
+                              meta.get("name", fav_id))
+                else:
+                    log.debug("Skipping ghost for favourite %s (no metadata)", fav_id)
+
         outputs = [d for d in devices if d.flow == DeviceFlow.OUTPUT]
         inputs = [d for d in devices if d.flow == DeviceFlow.INPUT]
 
@@ -493,8 +613,46 @@ class DeviceDropdown(QWidget):
         self._anim.start()
 
     def _on_device_clicked(self, device: AudioDevice) -> None:
+        if self._bt_busy:
+            return  # ignore clicks while a BT op is running
+
+        # BT connect: disconnected BT favourite → keep dropdown open
+        if not device.is_connected and device.is_bluetooth:
+            self._bt_busy = True
+            self._set_row_status(device.id, "Connecting\u2026")
+            self.bt_connect_requested.emit(device)
+            return
+
+        # BT disconnect: default BT device → keep dropdown open
+        if device.is_default and device.is_bluetooth:
+            self._bt_busy = True
+            self._set_row_status(device.id, "Disconnecting\u2026")
+            self.bt_disconnect_requested.emit(device)
+            return
+
+        # Normal device selection — emit and close
         self.device_selected.emit(device)
         self._fade_out_and_close()
+
+    def _set_row_status(self, device_id: str, text: str) -> None:
+        """Update the name label on a device row (e.g. 'Connecting…')."""
+        row = self._rows_by_device_id.get(device_id)
+        if row:
+            row.set_name_text(text)
+
+    def show_bt_result(self, device_id: str, success: bool, action: str) -> None:
+        """Show BT operation result on the row, then close or reset.
+
+        On success → close dropdown after a short delay.
+        On failure → show failure text, then close after 2 seconds.
+        """
+        self._bt_busy = False
+        if success:
+            self._fade_out_and_close()
+        else:
+            label = "Connection failed" if action == "connect" else "Disconnect failed"
+            self._set_row_status(device_id, label)
+            QTimer.singleShot(2000, self._fade_out_and_close)
 
     def _on_fav_toggled(self, device: AudioDevice) -> None:
         self.favourite_toggled.emit(device)
@@ -578,6 +736,27 @@ class _BodyWidget(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# _BluetoothWorker — runs BT connect/disconnect off the UI thread
+# ---------------------------------------------------------------------------
+class _BluetoothWorker(QObject):
+    """Performs Bluetooth connect/disconnect in a background thread."""
+
+    finished = pyqtSignal(bool, str)  # success, action ("connect" or "disconnect")
+
+    def __init__(self, device_name: str, action: str) -> None:
+        super().__init__()
+        self._device_name = device_name
+        self._action = action  # "connect" or "disconnect"
+
+    def run(self) -> None:
+        if self._action == "connect":
+            ok = bluetooth_connect(self._device_name)
+        else:
+            ok = bluetooth_disconnect(self._device_name)
+        self.finished.emit(ok, self._action)
+
+
+# ---------------------------------------------------------------------------
 # AudioFlipWidget — the main always-on-top widget
 # ---------------------------------------------------------------------------
 class AudioFlipWidget(QWidget):
@@ -609,6 +788,11 @@ class AudioFlipWidget(QWidget):
         self._ctx_menu_closed_at: float = 0.0
         self._last_default_id: str | None = None  # track for flash detection
         self._flash_alpha: float = 0.0
+        self._bt_thread: QThread | None = None
+        self._bt_worker: _BluetoothWorker | None = None
+        self._bt_pending_device_id: str | None = None  # old device ID (may be stale after reconnect)
+        self._bt_pending_device_name: str | None = None  # device name for name-based fallback
+        self._bt_active_device_id: str | None = None  # device ID the dropdown is showing status for
 
         # Build body container
         self._body = _BodyWidget(self)
@@ -814,6 +998,8 @@ class AudioFlipWidget(QWidget):
             self._audio_mgr, self._icon_mgr, self._config_mgr
         )
         self._dropdown.device_selected.connect(self._on_device_selected)
+        self._dropdown.bt_connect_requested.connect(self._bt_connect_and_switch)
+        self._dropdown.bt_disconnect_requested.connect(self._bt_disconnect)
         self._dropdown.favourite_toggled.connect(self._on_fav_toggled_dropdown)
         self._dropdown.closed.connect(self._on_dropdown_closed)
 
@@ -823,16 +1009,136 @@ class AudioFlipWidget(QWidget):
         )
 
     def _on_device_selected(self, device: AudioDevice) -> None:
-        """Handle user clicking a device in the dropdown."""
+        """Handle user clicking a non-BT device in the dropdown (normal switch)."""
         success = self._audio_mgr.set_default_device(device.id)
         if success:
             self._refresh_display()
         else:
             log.warning("Failed to switch to device: %s", device.name)
 
+    def _bt_connect_and_switch(self, device: AudioDevice) -> None:
+        """Kick off BT connect in a background thread."""
+        if self._bt_thread is not None:
+            return  # already running a BT operation
+        self._bt_pending_device_id = device.id
+        self._bt_pending_device_name = device.name
+        self._bt_active_device_id = device.id
+        self._name_label.setText("Connecting\u2026")
+
+        self._bt_worker = _BluetoothWorker(device.name, "connect")
+        self._bt_thread = QThread()
+        self._bt_worker.moveToThread(self._bt_thread)
+        self._bt_thread.started.connect(self._bt_worker.run)
+        self._bt_worker.finished.connect(self._on_bt_finished)
+        self._bt_worker.finished.connect(self._bt_thread.quit)
+        self._bt_thread.finished.connect(self._bt_cleanup)
+        self._bt_thread.start()
+
+    def _bt_disconnect(self, device: AudioDevice) -> None:
+        """Kick off BT disconnect in a background thread."""
+        if self._bt_thread is not None:
+            return
+        self._bt_pending_device_id = None
+        self._bt_pending_device_name = None
+        self._bt_active_device_id = device.id
+        self._name_label.setText("Disconnecting\u2026")
+
+        self._bt_worker = _BluetoothWorker(device.name, "disconnect")
+        self._bt_thread = QThread()
+        self._bt_worker.moveToThread(self._bt_thread)
+        self._bt_thread.started.connect(self._bt_worker.run)
+        self._bt_worker.finished.connect(self._on_bt_finished)
+        self._bt_worker.finished.connect(self._bt_thread.quit)
+        self._bt_thread.finished.connect(self._bt_cleanup)
+        self._bt_thread.start()
+
+    def _on_bt_finished(self, success: bool, action: str) -> None:
+        """Handle BT worker completion (runs on main thread via signal)."""
+        device_id = self._bt_active_device_id
+
+        # Update dropdown row status
+        if self._dropdown and self._dropdown.isVisible():
+            if action == "connect" and success:
+                self._dropdown._set_row_status(device_id or "", "Connected \u2014 switching\u2026")
+            elif not success:
+                # Show failure on dropdown, it will auto-close after 2s
+                self._dropdown.show_bt_result(device_id or "", False, action)
+
+        if action == "connect" and success:
+            # Wait for Windows to register the new endpoint, then switch
+            QTimer.singleShot(1500, self._set_pending_bt_device)
+        elif action == "disconnect" and success:
+            # Close dropdown and refresh after a brief pause
+            if self._dropdown and self._dropdown.isVisible():
+                self._dropdown.show_bt_result(device_id or "", True, action)
+            QTimer.singleShot(500, self._refresh_display)
+        else:
+            # Failure — show "Failed" on widget label, refresh after a pause
+            fail_label = "Connect failed" if action == "connect" else "Disconnect failed"
+            self._name_label.setText(fail_label)
+            self._bt_pending_device_id = None
+            self._bt_pending_device_name = None
+            self._bt_active_device_id = None
+            QTimer.singleShot(2000, self._refresh_display)
+
+    def _set_pending_bt_device(self) -> None:
+        """Set the BT device as default after it has reconnected.
+
+        The old device ID may no longer exist (BT devices often get new
+        endpoint IDs on reconnect), so we fall back to name-based matching.
+        """
+        dev_id = self._bt_pending_device_id
+        dev_name = self._bt_pending_device_name
+        self._bt_pending_device_id = None
+        self._bt_pending_device_name = None
+        dropdown_device_id = self._bt_active_device_id
+        self._bt_active_device_id = None
+
+        if dev_id:
+            # Try the stored ID first
+            ok = self._audio_mgr.set_default_device(dev_id)
+            if not ok and dev_name:
+                # ID is stale — find the new endpoint by name
+                log.info("Old device ID failed, searching by name: '%s'", dev_name)
+                new_dev = self._find_bt_device_by_name(dev_name)
+                if new_dev:
+                    log.info("Found new endpoint: '%s' (%s)", new_dev.name, new_dev.id)
+                    ok = self._audio_mgr.set_default_device(new_dev.id)
+                else:
+                    log.warning("No active BT endpoint found matching '%s'", dev_name)
+            if ok:
+                if self._dropdown and self._dropdown.isVisible():
+                    self._dropdown.show_bt_result(dropdown_device_id or "", True, "connect")
+            else:
+                if self._dropdown and self._dropdown.isVisible():
+                    self._dropdown.show_bt_result(dropdown_device_id or "", False, "connect")
+                self._name_label.setText("Switch failed")
+                QTimer.singleShot(2000, self._refresh_display)
+                return
+
+        self._refresh_display()
+
+    def _find_bt_device_by_name(self, name: str) -> AudioDevice | None:
+        """Find an active BT audio device whose name matches the given name."""
+        for dev in self._audio_mgr.enumerate_devices():
+            if dev.is_bluetooth and _bt_names_match(dev.name, name):
+                return dev
+        return None
+
+    def _bt_cleanup(self) -> None:
+        """Clean up the BT worker thread."""
+        if self._bt_worker:
+            self._bt_worker.deleteLater()
+            self._bt_worker = None
+        if self._bt_thread:
+            self._bt_thread.deleteLater()
+            self._bt_thread = None
+
     def _on_fav_toggled_dropdown(self, device: AudioDevice) -> None:
         """Toggle favourite for a device, then refresh the dropdown."""
-        self._config_mgr.toggle_favourite(device.id)
+        self._config_mgr.toggle_favourite(
+            device.id, device.name, device.flow.value, device.is_bluetooth,
+        )
         # Re-open to reflect change — reset timestamp so the re-open isn't suppressed
         self._dropdown_closed_at = 0.0
         self._open_dropdown()
@@ -1097,6 +1403,9 @@ class AudioFlipWidget(QWidget):
         self._poll_timer.stop()
         self._topmost_timer.stop()
         self._flash_timer.stop()
+        if self._bt_thread and self._bt_thread.isRunning():
+            self._bt_thread.quit()
+            self._bt_thread.wait(3000)
         if self._tray:
             self._tray.hide()
         if self._dropdown:
