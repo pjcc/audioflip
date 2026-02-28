@@ -26,32 +26,41 @@ A persistent, always-on-top Windows desktop widget for switching audio devices.
 
 ## Setup
 
-```bash
-# Clone or download the project, then:
+> **Note:** Python 3.12+ does not guarantee pip is included in a new venv. The steps below use explicit venv paths throughout to avoid packages silently installing to the wrong location.
+```powershell
+# Clone the repo
+git clone https://github.com/pjcc/audioflip.git
 cd audioflip
 
-# Create a virtual environment (recommended)
+# Create the virtual environment
 python -m venv .venv
-.venv\Scripts\activate
 
-# Install dependencies
-pip install -r requirements.txt
+# Bootstrap pip into the venv
+.venv\Scripts\python.exe -m ensurepip
+
+# Install all dependencies into the venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 ## Running
-
-```bash
-python run.py
+```powershell
+.venv\Scripts\python.exe run.py
 ```
 
 ## Building a Standalone .exe
-
-```bash
-# Install PyInstaller (included in requirements.txt)
-pyinstaller audioflip.spec
+```powershell
+.venv\Scripts\python.exe -m PyInstaller audioflip.spec
 ```
 
 The output will be at `dist/audioflip.exe` — a single portable executable.
+
+> If you get `PermissionError: Access is denied` on rebuild, the previous `audioflip.exe` is still running. Stop it first:
+> ```powershell
+> Stop-Process -Name "audioflip" -Force -ErrorAction SilentlyContinue
+> ```
+
+> **Why not just activate the venv and use `pip` normally?**  
+> On Python 3.12+, `pip` after activation can still resolve to a user-level install rather than the venv. Using `.venv\Scripts\python.exe -m pip` is unambiguous regardless of system configuration.
 
 ## Configuration
 
