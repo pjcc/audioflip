@@ -10,6 +10,9 @@ A persistent, always-on-top Windows desktop widget for switching audio devices.
 - Auto-assigned icons based on device name (headphones, speakers, Bluetooth, etc.)
 - Customisable per-device icons via right-click menu
 - Favourite devices (right-click a device in the dropdown)
+- Bluetooth-aware favourites — disconnected BT devices stay visible (greyed out) in the dropdown
+- Click a greyed BT favourite to connect and switch; click the active BT device to disconnect
+- Automatic Bluetooth endpoint ID reconciliation (handles Windows reassigning new IDs on reconnect)
 - Scroll wheel to adjust volume (with visual overlay bar)
 - Border flash animation on device change
 - 10 colour themes
@@ -75,6 +78,7 @@ Settings are stored in `%APPDATA%\audioflip\config.json`:
   "icon_overrides": {},
   "theme": "dark",
   "favourites": [],
+  "favourite_devices": {},
   "flash_on_change": true
 }
 ```
@@ -88,6 +92,7 @@ Settings are stored in `%APPDATA%\audioflip\config.json`:
 | `icon_overrides` | `{"device-id": "icon-key"}` | Per-device icon overrides |
 | `theme` | Theme name | UI theme |
 | `favourites` | `["device-id", ...]` | Pinned devices |
+| `favourite_devices` | `{"device-id": {...}}` | Cached metadata for favourites (name, flow, is_bluetooth) |
 | `flash_on_change` | `true` / `false` | Flash border on device switch |
 
 ### Available Themes
@@ -127,6 +132,7 @@ audioflip/
     ├── main.py             # Application entry point
     ├── config.py           # Configuration management
     ├── audio_manager.py    # Windows Core Audio integration
+    ├── bluetooth.py        # Bluetooth connect/disconnect via Windows API
     ├── icons.py            # Icon matching and rendering
     └── ui.py               # PyQt6 widget, dropdown, context menu
 ```
@@ -137,4 +143,6 @@ audioflip/
 - **Device switching**: Uses the undocumented `IPolicyConfig` COM interface (`SetDefaultEndpoint`) to change the system default device. Falls back to PowerShell `Set-AudioDevice` if available.
 - **Change notifications**: Registers an `IMMNotificationClient` callback for real-time device change events, with a 2-second polling fallback.
 - **Always-on-top**: Win32 `SetWindowPos` with `HWND_TOPMOST` for true taskbar-level always-on-top, re-asserted every 500ms.
+- **Bluetooth management**: Calls `BluetoothSetServiceState` via `ctypes` to toggle A2DP Sink and HFP service connections. Connect/disconnect runs on a background `QThread` to keep the UI responsive (~5–7 seconds per operation).
+- **BT endpoint reconciliation**: Windows assigns a new audio endpoint ID each time a Bluetooth device reconnects. Audioflip detects this by matching the BT device name inside the endpoint friendly name and automatically migrates the favourite, metadata, and icon overrides to the new ID.
 - **UI**: PyQt6 frameless window with 10 colour themes, drag support, popup dropdown, and system tray icon.

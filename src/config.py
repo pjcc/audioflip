@@ -39,6 +39,7 @@ class Config:
     icon_overrides: dict[str, str] = field(default_factory=dict)
     theme: str = "dark"
     favourites: list[str] = field(default_factory=list)  # device IDs pinned to top
+    favourite_devices: dict[str, dict] = field(default_factory=dict)  # {id: {name, flow, is_bluetooth}}
     flash_on_change: bool = True
 
     def __post_init__(self) -> None:
@@ -95,6 +96,7 @@ class ConfigManager:
                 icon_overrides=data.get("icon_overrides", {}),
                 theme=data.get("theme", "dark"),
                 favourites=data.get("favourites", []),
+                favourite_devices=data.get("favourite_devices", {}),
                 flash_on_change=data.get("flash_on_change", True),
             )
         except (json.JSONDecodeError, KeyError, TypeError):
@@ -142,18 +144,65 @@ class ConfigManager:
             self._config.theme = theme
             self.save()
 
-    def toggle_favourite(self, device_id: str) -> bool:
-        """Toggle a device as favourite. Returns True if now favourite."""
+    def toggle_favourite(
+        self,
+        device_id: str,
+        device_name: str = "",
+        flow: str = "output",
+        is_bluetooth: bool = False,
+    ) -> bool:
+        """Toggle a device as favourite. Returns True if now favourite.
+
+        When adding, stores metadata so disconnected devices can appear as
+        ghost entries in the dropdown.
+        """
         if device_id in self._config.favourites:
             self._config.favourites.remove(device_id)
+            self._config.favourite_devices.pop(device_id, None)
             self.save()
             return False
         self._config.favourites.append(device_id)
+        self._config.favourite_devices[device_id] = {
+            "name": device_name,
+            "flow": flow,
+            "is_bluetooth": is_bluetooth,
+        }
         self.save()
         return True
 
     def is_favourite(self, device_id: str) -> bool:
         return device_id in self._config.favourites
+
+    def get_favourite_devices(self) -> dict[str, dict]:
+        """Return the favourite device metadata dict."""
+        return self._config.favourite_devices
+
+    def migrate_favourite_id(self, old_id: str, new_id: str, new_name: str = "") -> None:
+        """Replace *old_id* with *new_id* in favourites, metadata, and icon overrides.
+
+        Used when a Bluetooth device reconnects with a different endpoint ID
+        but the same underlying device name.
+        """
+        if old_id not in self._config.favourites:
+            return
+
+        # Swap in favourites list (preserve order)
+        idx = self._config.favourites.index(old_id)
+        self._config.favourites[idx] = new_id
+
+        # Migrate metadata
+        meta = self._config.favourite_devices.pop(old_id, None)
+        if meta:
+            if new_name:
+                meta["name"] = new_name
+            self._config.favourite_devices[new_id] = meta
+
+        # Migrate icon override
+        icon = self._config.icon_overrides.pop(old_id, None)
+        if icon is not None:
+            self._config.icon_overrides[new_id] = icon
+
+        self.save()
 
     def set_flash_on_change(self, value: bool) -> None:
         self._config.flash_on_change = value
