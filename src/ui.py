@@ -18,6 +18,7 @@ from PyQt6.QtCore import (
     QPoint,
     QPropertyAnimation,
     QEasingCurve,
+    QRectF,
     QTimer,
     pyqtSignal,
     QSize,
@@ -31,8 +32,10 @@ from PyQt6.QtGui import (
     QIcon,
     QMouseEvent,
     QPainter,
+    QPainterPath,
     QPaintEvent,
     QPen,
+    QWheelEvent,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -42,6 +45,8 @@ from PyQt6.QtWidgets import (
     QMenu,
     QScrollArea,
     QSizePolicy,
+    QStyle,
+    QStyleOption,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -506,6 +511,73 @@ class DeviceDropdown(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# _BodyWidget — widget body that paints a volume bar in its own paint cycle
+# ---------------------------------------------------------------------------
+class _BodyWidget(QWidget):
+    """Widget body that can also paint a volume overlay bar.
+
+    By painting the volume bar in the same paintEvent as the background,
+    we avoid the parent-child repaint flicker of a separate overlay widget.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._vol_level: float = 0.0
+        self._vol_opacity: float = 0.0
+        self._vol_accent = QColor("#89b4fa")
+
+        self._vol_hide_timer = QTimer(self)
+        self._vol_hide_timer.setSingleShot(True)
+        self._vol_hide_timer.timeout.connect(self._vol_start_fade)
+
+        self._vol_fade_timer = QTimer(self)
+        self._vol_fade_timer.setInterval(30)
+        self._vol_fade_timer.timeout.connect(self._vol_tick_fade)
+
+    def show_volume(self, level: float, theme: dict[str, str]) -> None:
+        self._vol_level = max(0.0, min(1.0, level))
+        self._vol_accent = QColor(theme["accent"])
+        self._vol_opacity = 1.0
+        self._vol_fade_timer.stop()
+        self._vol_hide_timer.start(1500)
+        self.update()
+
+    @property
+    def volume_active(self) -> bool:
+        return self._vol_opacity > 0.01
+
+    def _vol_start_fade(self) -> None:
+        self._vol_fade_timer.start()
+
+    def _vol_tick_fade(self) -> None:
+        self._vol_opacity -= 0.06
+        if self._vol_opacity <= 0.0:
+            self._vol_opacity = 0.0
+            self._vol_fade_timer.stop()
+        self.update()
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        # Custom QWidget subclasses must explicitly paint their stylesheet
+        painter = QPainter(self)
+        opt = QStyleOption()
+        opt.initFrom(self)
+        self.style().drawPrimitive(QStyle.PrimitiveElement.PE_Widget, opt, painter, self)
+
+        if self._vol_opacity > 0.01:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setOpacity(self._vol_opacity)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(self.rect()), _RADIUS, _RADIUS)
+            painter.setClipPath(path)
+            fill_w = int(self.width() * self._vol_level)
+            bar_color = QColor(self._vol_accent)
+            bar_color.setAlpha(80)
+            painter.fillRect(0, 0, fill_w, self.height(), bar_color)
+
+        painter.end()
+
+
+# ---------------------------------------------------------------------------
 # AudioFlipWidget — the main always-on-top widget
 # ---------------------------------------------------------------------------
 class AudioFlipWidget(QWidget):
@@ -539,7 +611,7 @@ class AudioFlipWidget(QWidget):
         self._flash_alpha: float = 0.0
 
         # Build body container
-        self._body = QWidget(self)
+        self._body = _BodyWidget(self)
         self._body.setObjectName("WidgetBody")
 
         body_layout = QHBoxLayout(self._body)
@@ -680,7 +752,7 @@ class AudioFlipWidget(QWidget):
             self._name_label.maximumWidth(),
         )
         self._name_label.setText(elided)
-        self._name_label.setToolTip(device.name)
+        self._name_label.setToolTip("")
 
     def _on_device_change_com(self) -> None:
         """Called from COM thread — schedule a Qt-safe refresh."""
@@ -769,6 +841,29 @@ class AudioFlipWidget(QWidget):
         """Record when the dropdown closes so we can suppress immediate reopen."""
         self._dropdown_closed_at = time.monotonic()
         self._reset_drag()
+
+    # --- Volume scroll -----------------------------------------------------
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        """Scroll wheel adjusts the default device volume."""
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        mode = self._config_mgr.config.show_mode
+        flow = DeviceFlow.INPUT if mode == "input" else DeviceFlow.OUTPUT
+
+        # Use cached level if overlay is active to avoid API rounding jitter
+        if self._body.volume_active:
+            current = self._body._vol_level
+        else:
+            current = self._audio_mgr.get_default_volume(flow)
+            if current is None:
+                return
+
+        step = (delta / 120) * 0.02  # 2% per scroll notch
+        new_level = max(0.0, min(1.0, current + step))
+        if self._audio_mgr.set_default_volume(new_level, flow):
+            self._body.show_volume(new_level, _t(self._config_mgr))
 
     # --- Context menu (shared between widget and tray) ---------------------
 
