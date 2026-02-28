@@ -10,6 +10,7 @@ A persistent, always-on-top Windows desktop widget for switching audio devices.
 - Auto-assigned icons based on device name (headphones, speakers, Bluetooth, etc.)
 - Customisable per-device icons via right-click menu
 - Favourite devices (right-click a device in the dropdown)
+- Scroll wheel to adjust volume (with visual overlay bar)
 - Border flash animation on device change
 - 10 colour themes
 - Draggable positioning (persisted between sessions)
