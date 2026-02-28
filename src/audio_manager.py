@@ -14,11 +14,12 @@ from typing import Callable
 
 import comtypes
 from comtypes import GUID, HRESULT, COMMETHOD
-from ctypes import POINTER, c_uint, c_wchar_p
+from ctypes import POINTER, c_uint, c_wchar_p, cast
 from ctypes.wintypes import LPCWSTR, DWORD, BOOL
 
 from pycaw.pycaw import (
     AudioUtilities,
+    IAudioEndpointVolume,
     IMMDeviceEnumerator,
     IMMDevice,
     IMMNotificationClient,
@@ -29,6 +30,7 @@ from pycaw.pycaw import (
 
 log = logging.getLogger(__name__)
 
+_CLSCTX_ALL = 0x17  # CLSCTX_INPROC_SERVER | INPROC_HANDLER | LOCAL_SERVER | REMOTE_SERVER
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -302,3 +304,29 @@ class AudioManager:
             if d.flow == DeviceFlow.INPUT and d.is_default:
                 return d
         return None
+
+    def get_default_volume(self, flow: DeviceFlow = DeviceFlow.OUTPUT) -> float | None:
+        """Get master volume scalar (0.0-1.0) of the default device."""
+        try:
+            edata = EDataFlow.eRender.value if flow == DeviceFlow.OUTPUT else EDataFlow.eCapture.value
+            dev = self._enumerator.GetDefaultAudioEndpoint(edata, ERole.eMultimedia.value)
+            interface = dev.Activate(IAudioEndpointVolume._iid_, _CLSCTX_ALL, None)
+            vol = cast(interface, POINTER(IAudioEndpointVolume))
+            return vol.GetMasterVolumeLevelScalar()
+        except Exception as exc:
+            log.warning("Failed to get volume: %s", exc)
+            return None
+
+    def set_default_volume(self, level: float, flow: DeviceFlow = DeviceFlow.OUTPUT) -> bool:
+        """Set master volume scalar (0.0-1.0) of the default device."""
+        try:
+            level = max(0.0, min(1.0, level))
+            edata = EDataFlow.eRender.value if flow == DeviceFlow.OUTPUT else EDataFlow.eCapture.value
+            dev = self._enumerator.GetDefaultAudioEndpoint(edata, ERole.eMultimedia.value)
+            interface = dev.Activate(IAudioEndpointVolume._iid_, _CLSCTX_ALL, None)
+            vol = cast(interface, POINTER(IAudioEndpointVolume))
+            vol.SetMasterVolumeLevelScalar(level, None)
+            return True
+        except Exception as exc:
+            log.error("Failed to set volume: %s", exc)
+            return False
