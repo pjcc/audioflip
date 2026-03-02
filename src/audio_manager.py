@@ -171,7 +171,7 @@ class AudioManager:
             A list of AudioDevice instances, with is_default set for
             the current default render and capture devices.
         """
-        log.info("enumerate_devices() called")
+        log.debug("enumerate_devices() called")
         devices: list[AudioDevice] = []
 
         default_output_id = self._get_default_device_id(EDataFlow.eRender.value)
@@ -217,7 +217,30 @@ class AudioManager:
                         is_bt = enumerator_name.startswith("BTH")
                     except Exception as exc:
                         log.debug("Enumerator detection failed for '%s': %s", name, exc)
-                    log.info("Device '%s' enumerator='%s' is_bt=%s", name, enumerator_name, is_bt)
+
+                    # Fallback: cross-reference against paired BT device names.
+                    # Intel/Dell audio controllers proxy BT audio through their
+                    # own driver, reporting enumerator='INTELAUDIO' instead of
+                    # a BTH* prefix.  Match the audio endpoint name against the
+                    # BT stack's paired device list (cached, refreshed every 30s).
+                    if not is_bt:
+                        try:
+                            from .bluetooth import get_paired_device_names
+                            name_lower = name.lower()
+                            for bt_name in get_paired_device_names():
+                                bt_lower = bt_name.lower()
+                                if bt_lower in name_lower or name_lower in bt_lower:
+                                    is_bt = True
+                                    log.info(
+                                        "Device '%s' matched paired BT device '%s' "
+                                        "(name cross-ref, enumerator='%s')",
+                                        name, bt_name, enumerator_name,
+                                    )
+                                    break
+                        except Exception as exc:
+                            log.debug("BT name cross-ref failed for '%s': %s", name, exc)
+
+                    log.debug("Device '%s' enumerator='%s' is_bt=%s", name, enumerator_name, is_bt)
 
                     default_id = (
                         default_output_id

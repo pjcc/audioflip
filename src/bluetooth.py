@@ -17,6 +17,7 @@ import ctypes.wintypes
 import json
 import logging
 import subprocess
+import time
 from ctypes import (
     POINTER,
     byref,
@@ -236,6 +237,35 @@ def is_bluetooth_available() -> bool:
     """Return True if Windows Bluetooth APIs are accessible."""
     _load_bt()
     return _bt_available is True
+
+
+# ---------------------------------------------------------------------------
+# Paired device name cache (used by audio_manager for BT detection fallback)
+# ---------------------------------------------------------------------------
+_paired_names_cache: list[str] | None = None
+_paired_names_cache_time: float = 0.0
+_PAIRED_NAMES_CACHE_TTL = 30.0  # seconds
+
+
+def get_paired_device_names() -> list[str]:
+    """Return names of all paired Bluetooth devices (cached).
+
+    Results are cached for 30 seconds to avoid calling Win32 BT
+    enumeration on every audio device poll (~1/s).  Used by
+    AudioManager.enumerate_devices() as a fallback when the Windows
+    audio enumerator property doesn't indicate Bluetooth (e.g. Intel
+    audio controllers that proxy BT audio as INTELAUDIO).
+    """
+    global _paired_names_cache, _paired_names_cache_time
+    now = time.monotonic()
+    if _paired_names_cache is not None and (now - _paired_names_cache_time) < _PAIRED_NAMES_CACHE_TTL:
+        return _paired_names_cache
+
+    devices = _find_paired_devices()
+    _paired_names_cache = [d.szName.strip() for d in devices if d.szName.strip()]
+    _paired_names_cache_time = now
+    log.debug("Refreshed paired BT device names cache: %s", _paired_names_cache)
+    return _paired_names_cache
 
 
 # ---------------------------------------------------------------------------
