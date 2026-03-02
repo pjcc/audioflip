@@ -1461,7 +1461,7 @@ class AudioFlipWidget(QWidget):
             self._dropdown.deleteLater()
 
         self._dropdown = DeviceDropdown(
-            self._audio_mgr, self._icon_mgr, self._config_mgr
+            self._audio_mgr, self._icon_mgr, self._config_mgr, parent=self
         )
         self._dropdown.device_selected.connect(self._on_device_selected)
         self._dropdown.bt_connect_requested.connect(self._bt_connect_and_switch)
