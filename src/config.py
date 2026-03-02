@@ -41,6 +41,7 @@ class Config:
     favourites: list[str] = field(default_factory=list)  # device IDs pinned to top
     favourite_devices: dict[str, dict] = field(default_factory=dict)  # {id: {name, flow, is_bluetooth}}
     flash_on_change: bool = True
+    show_volume_bar: bool = False
 
     def __post_init__(self) -> None:
         if self.show_mode not in ("output", "input", "both"):
@@ -98,6 +99,7 @@ class ConfigManager:
                 favourites=data.get("favourites", []),
                 favourite_devices=data.get("favourite_devices", {}),
                 flash_on_change=data.get("flash_on_change", True),
+                show_volume_bar=data.get("show_volume_bar", False),
             )
         except (json.JSONDecodeError, KeyError, TypeError):
             return Config()
@@ -206,6 +208,10 @@ class ConfigManager:
 
     def set_flash_on_change(self, value: bool) -> None:
         self._config.flash_on_change = value
+        self.save()
+
+    def set_show_volume_bar(self, value: bool) -> None:
+        self._config.show_volume_bar = value
         self.save()
 
     @staticmethod

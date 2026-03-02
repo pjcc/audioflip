@@ -38,6 +38,7 @@ from PyQt6.QtGui import (
     QPaintEvent,
     QPen,
     QPixmap,
+    QRegion,
     QWheelEvent,
 )
 from PyQt6.QtWidgets import (
@@ -632,6 +633,11 @@ class DeviceDropdown(QWidget):
         height = min(container.sizeHint().height() + 16, 420)
         self.setFixedSize(width, height)
 
+        # Apply rounded mask to clip the native window corners
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, width, height), _RADIUS, _RADIUS)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
         if reposition:
             x = anchor.x()
             if grows_up:
@@ -744,13 +750,21 @@ class _BodyWidget(QWidget):
         self._vol_fade_timer.setInterval(30)
         self._vol_fade_timer.timeout.connect(self._vol_tick_fade)
 
-    def show_volume(self, level: float, theme: dict[str, str]) -> None:
+    def show_volume(self, level: float, theme: dict[str, str], persistent: bool = False) -> None:
         self._vol_level = max(0.0, min(1.0, level))
         self._vol_accent = QColor(theme["accent"])
         self._vol_opacity = 1.0
         self._vol_fade_timer.stop()
-        self._vol_hide_timer.start(1500)
+        if persistent:
+            self._vol_hide_timer.stop()
+        else:
+            self._vol_hide_timer.start(1500)
         self.update()
+
+    def hide_volume(self) -> None:
+        """Immediately start fading the volume bar."""
+        self._vol_hide_timer.stop()
+        self._vol_start_fade()
 
     @property
     def volume_active(self) -> bool:
@@ -1033,6 +1047,16 @@ class AudioFlipWidget(QWidget):
         self._name_label.setText(elided)
         self._name_label.setToolTip("")
 
+        # Persistent volume bar: keep it updated if enabled
+        if self._config_mgr.config.show_volume_bar:
+            flow = DeviceFlow.INPUT if mode == "input" else DeviceFlow.OUTPUT
+            vol = self._audio_mgr.get_default_volume(flow)
+            if vol is not None:
+                self._body.show_volume(vol, t, persistent=True)
+        elif not self._body.volume_active:
+            pass  # not persistent and already hidden — nothing to do
+        # If the user just toggled OFF the persistent bar, next fade will handle it
+
     def _on_device_change_com(self) -> None:
         """Called from COM thread — schedule a Qt-safe refresh."""
         QTimer.singleShot(0, self._refresh_display)
@@ -1130,12 +1154,20 @@ class AudioFlipWidget(QWidget):
         self._bt_thread.start()
 
     def _bt_disconnect(self, device: AudioDevice) -> None:
-        """Kick off BT disconnect in a background thread."""
+        """Kick off BT disconnect in a background thread.
+
+        Immediately switches audio to the best non-BT device so the user
+        doesn't have to wait for the (potentially slow) BT disconnect.
+        """
         if self._bt_thread is not None:
             return
         self._bt_pending_device_id = None
         self._bt_pending_device_name = None
         self._bt_active_device_id = device.id
+
+        # Immediately switch to a non-BT fallback device
+        self._switch_to_fallback(device)
+
         self._name_label.setText("Disconnecting\u2026")
 
         self._bt_worker = _BluetoothWorker(device.name, "disconnect")
@@ -1146,6 +1178,28 @@ class AudioFlipWidget(QWidget):
         self._bt_worker.finished.connect(self._bt_thread.quit)
         self._bt_thread.finished.connect(self._bt_cleanup)
         self._bt_thread.start()
+
+    def _switch_to_fallback(self, bt_device: AudioDevice) -> None:
+        """Immediately switch to the best non-BT device with the same flow.
+
+        Called before starting the BT disconnect so the user hears audio
+        switch instantly rather than waiting for the BT stack.
+        """
+        devices = self._audio_mgr.enumerate_devices()
+        candidates = [
+            d for d in devices
+            if d.flow == bt_device.flow and not d.is_bluetooth and d.id != bt_device.id
+        ]
+        if candidates:
+            target = candidates[0]
+            log.info(
+                "Immediate fallback switch: '%s' -> '%s'",
+                bt_device.name, target.name,
+            )
+            self._audio_mgr.set_default_device(target.id)
+            self._refresh_display()
+        else:
+            log.warning("No non-BT fallback device found for flow=%s", bt_device.flow.value)
 
     def _on_bt_finished(self, success: bool, action: str) -> None:
         """Handle BT worker completion (runs on main thread via signal)."""
@@ -1162,6 +1216,8 @@ class AudioFlipWidget(QWidget):
         if action == "connect" and success:
             # Wait for Windows to register the new endpoint, then switch
             QTimer.singleShot(1500, self._set_pending_bt_device)
+            # Secondary refresh for slow BT stacks (e.g. Dell/Intel)
+            QTimer.singleShot(4000, self._delayed_bt_ui_refresh)
         elif action == "disconnect" and success:
             # Close dropdown and refresh after a brief pause
             if self._dropdown and self._dropdown.isVisible():
@@ -1212,6 +1268,17 @@ class AudioFlipWidget(QWidget):
                 return
 
         self._refresh_display()
+
+    def _delayed_bt_ui_refresh(self) -> None:
+        """Secondary refresh for slow BT stacks (Dell/Intel).
+
+        Runs ~4s after BT connect to catch delayed endpoint registration.
+        Re-scans devices and, if a matching BT endpoint exists that isn't
+        default yet, sets it as default and refreshes the dropdown.
+        """
+        self._refresh_display()
+        if self._dropdown and self._dropdown.isVisible():
+            self._dropdown._repopulate()
 
     def _find_bt_device_by_name(self, name: str) -> AudioDevice | None:
         """Find an active BT audio device whose name matches the given name."""
@@ -1264,7 +1331,8 @@ class AudioFlipWidget(QWidget):
         step = (delta / 120) * 0.02  # 2% per scroll notch
         new_level = max(0.0, min(1.0, current + step))
         if self._audio_mgr.set_default_volume(new_level, flow):
-            self._body.show_volume(new_level, _t(self._config_mgr))
+            persistent = self._config_mgr.config.show_volume_bar
+            self._body.show_volume(new_level, _t(self._config_mgr), persistent=persistent)
 
     # --- Context menu (shared between widget and tray) ---------------------
 
@@ -1275,28 +1343,35 @@ class AudioFlipWidget(QWidget):
         menu.setStyleSheet(_menu_stylesheet(t))
 
         # Always on top
-        aot_action = QAction("Always on Top", self)
+        aot_action = QAction("Always on top", self)
         aot_action.setCheckable(True)
         aot_action.setChecked(self._config_mgr.config.always_on_top)
         aot_action.triggered.connect(self._toggle_always_on_top)
         menu.addAction(aot_action)
 
         # Flash on change
-        flash_action = QAction("Flash on Change", self)
+        flash_action = QAction("Flash on change", self)
         flash_action.setCheckable(True)
         flash_action.setChecked(self._config_mgr.config.flash_on_change)
         flash_action.triggered.connect(self._toggle_flash)
         menu.addAction(flash_action)
 
+        # Show volume bar
+        vol_bar_action = QAction("Show volume bar", self)
+        vol_bar_action.setCheckable(True)
+        vol_bar_action.setChecked(self._config_mgr.config.show_volume_bar)
+        vol_bar_action.triggered.connect(self._toggle_volume_bar)
+        menu.addAction(vol_bar_action)
+
         menu.addSeparator()
 
         # Show mode submenu
-        mode_menu = menu.addMenu("Show Devices")
+        mode_menu = menu.addMenu("Show devices")
         mode_menu.setStyleSheet(menu.styleSheet())
         current_mode = self._config_mgr.config.show_mode
         for label, mode_val in [
-            ("Output Only", "output"),
-            ("Input Only", "input"),
+            ("Output only", "output"),
+            ("Input only", "input"),
             ("Both", "both"),
         ]:
             action = QAction(label, self)
@@ -1308,7 +1383,7 @@ class AudioFlipWidget(QWidget):
             mode_menu.addAction(action)
 
         # Change icon for current device
-        change_icon_menu = menu.addMenu("Change Icon")
+        change_icon_menu = menu.addMenu("Change icon")
         change_icon_menu.setStyleSheet(menu.styleSheet())
         mode = self._config_mgr.config.show_mode
         device = (
@@ -1320,7 +1395,7 @@ class AudioFlipWidget(QWidget):
             for icon_key in ICON_TYPES:
                 icon_action = QAction(
                     self._icon_mgr.get_icon(icon_key, 16),
-                    icon_key.replace("_", " ").title(),
+                    icon_key.replace("_", " ").capitalize(),
                     self,
                 )
                 icon_action.triggered.connect(
@@ -1348,14 +1423,14 @@ class AudioFlipWidget(QWidget):
         menu.addSeparator()
 
         # Start with Windows
-        startup_action = QAction("Start with Windows", self)
+        startup_action = QAction("Start with windows", self)
         startup_action.setCheckable(True)
         startup_action.setChecked(self._config_mgr.config.start_with_windows)
         startup_action.triggered.connect(self._toggle_startup)
         menu.addAction(startup_action)
 
         # Move to Screen
-        move_action = QAction("Move to Screen", self)
+        move_action = QAction("Move to screen", self)
         move_action.triggered.connect(self._move_to_screen)
         menu.addAction(move_action)
 
@@ -1411,8 +1486,14 @@ class AudioFlipWidget(QWidget):
         return super().eventFilter(obj, event)
 
     def _elevate_menu(self, menu: QMenu) -> None:
-        """Make a menu window HWND_TOPMOST via Win32."""
+        """Make a menu window HWND_TOPMOST via Win32, and clip corners."""
         try:
+            # Apply rounded mask to clip the native window corners
+            sz = menu.size()
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(0, 0, sz.width(), sz.height()), 6, 6)
+            menu.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
             menu_hwnd = int(menu.winId())
             if menu_hwnd:
                 _user32.SetWindowPos(
@@ -1492,6 +1573,15 @@ class AudioFlipWidget(QWidget):
 
     def _toggle_flash(self, checked: bool) -> None:
         self._config_mgr.set_flash_on_change(checked)
+
+    def _toggle_volume_bar(self, checked: bool) -> None:
+        self._config_mgr.set_show_volume_bar(checked)
+        if checked:
+            # Show immediately
+            self._refresh_display()
+        else:
+            # Start fading out
+            self._body.hide_volume()
 
     def _toggle_startup(self, checked: bool) -> None:
         self._config_mgr.set_start_with_windows(checked)
