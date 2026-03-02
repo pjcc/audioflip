@@ -824,9 +824,15 @@ class AudioFlipWidget(QWidget):
         # Apply theme
         self._apply_theme()
 
-        # Restore position
+        # Restore position and ensure it's on a visible screen
         pos = self._config_mgr.config.position
         self.move(pos.get("x", 100), pos.get("y", 100))
+        self._ensure_on_screen()
+
+        # Re-check position when a monitor is disconnected
+        app = QApplication.instance()
+        if app is not None:
+            app.screenRemoved.connect(self._on_screen_removed)
 
         # Apply always-on-top from config
         self._apply_always_on_top(self._config_mgr.config.always_on_top)
@@ -863,6 +869,43 @@ class AudioFlipWidget(QWidget):
         )
         self._icon_mgr.set_tint(QColor(t["icon_tint"]))
         self.update()
+
+    # --- Screen / position guard -------------------------------------------
+
+    def _ensure_on_screen(self) -> None:
+        """If the widget centre is not within any visible screen, move it."""
+        centre = self.geometry().center()
+        for screen in QApplication.screens():
+            if screen.availableGeometry().contains(centre):
+                return  # visible — nothing to do
+        # Off-screen: move to centre of primary screen
+        primary = QApplication.primaryScreen()
+        if primary is None:
+            return
+        geo = primary.availableGeometry()
+        x = geo.x() + (geo.width() - self.width()) // 2
+        y = geo.y() + (geo.height() - self.height()) // 2
+        log.info("Widget off-screen — relocating to (%d, %d)", x, y)
+        self.move(x, y)
+        self._config_mgr.set_position(x, y)
+
+    def _on_screen_removed(self, _screen: object) -> None:
+        """Called when a monitor is disconnected."""
+        # Short delay so Qt can update its screen list before we check
+        QTimer.singleShot(500, self._ensure_on_screen)
+
+    def _move_to_screen(self) -> None:
+        """Move the widget to the centre of the current primary screen."""
+        primary = QApplication.primaryScreen()
+        if primary is None:
+            return
+        geo = primary.availableGeometry()
+        x = geo.x() + (geo.width() - self.width()) // 2
+        y = geo.y() + (geo.height() - self.height()) // 2
+        self.move(x, y)
+        self._config_mgr.set_position(x, y)
+        self.show()
+        self._apply_always_on_top(self._config_mgr.config.always_on_top)
 
     # --- Border flash animation -------------------------------------------
 
@@ -1258,6 +1301,11 @@ class AudioFlipWidget(QWidget):
         startup_action.setChecked(self._config_mgr.config.start_with_windows)
         startup_action.triggered.connect(self._toggle_startup)
         menu.addAction(startup_action)
+
+        # Move to Screen
+        move_action = QAction("Move to Screen", self)
+        move_action.triggered.connect(self._move_to_screen)
+        menu.addAction(move_action)
 
         menu.addSeparator()
 
