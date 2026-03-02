@@ -210,8 +210,10 @@ class AudioManager:
                         pk_enum.fmtid = G("{a45c254e-df1c-4efd-8020-67d146a850e0}")
                         pk_enum.pid = 24
                         pv_enum = props.GetValue(pk_enum)
-                        enumerator_name = pv_enum.GetValue() or ""
-                        is_bt = enumerator_name.upper() == "BTHENUM"
+                        enumerator_name = (pv_enum.GetValue() or "").upper()
+                        # Some stacks use BTHENUM, others BTHHFENUM, etc.
+                        is_bt = enumerator_name.startswith("BTH")
+                        log.info("Device '%s' enumerator='%s' is_bt=%s", name, enumerator_name, is_bt)
                     except Exception:
                         pass
 

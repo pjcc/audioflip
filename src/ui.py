@@ -628,6 +628,11 @@ class DeviceDropdown(QWidget):
         if self._bt_busy:
             return  # ignore clicks while a BT op is running
 
+        log.info(
+            "Device clicked: '%s' is_bt=%s is_connected=%s is_default=%s",
+            device.name, device.is_bluetooth, device.is_connected, device.is_default,
+        )
+
         # BT connect: disconnected BT favourite → keep dropdown open
         if not device.is_connected and device.is_bluetooth:
             self._bt_busy = True
@@ -635,8 +640,8 @@ class DeviceDropdown(QWidget):
             self.bt_connect_requested.emit(device)
             return
 
-        # BT disconnect: default BT device → keep dropdown open
-        if device.is_default and device.is_bluetooth:
+        # BT disconnect: connected BT device → keep dropdown open
+        if device.is_bluetooth and device.is_connected:
             self._bt_busy = True
             self._set_row_status(device.id, "Disconnecting\u2026")
             self.bt_disconnect_requested.emit(device)
