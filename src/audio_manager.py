@@ -171,6 +171,7 @@ class AudioManager:
             A list of AudioDevice instances, with is_default set for
             the current default render and capture devices.
         """
+        log.info("enumerate_devices() called")
         devices: list[AudioDevice] = []
 
         default_output_id = self._get_default_device_id(EDataFlow.eRender.value)
@@ -203,6 +204,7 @@ class AudioManager:
 
                     # Detect Bluetooth via PKEY_Device_EnumeratorName (pid 24)
                     is_bt = False
+                    enumerator_name = ""
                     try:
                         from comtypes import GUID as G
                         from pycaw.pycaw import PROPERTYKEY
@@ -213,9 +215,9 @@ class AudioManager:
                         enumerator_name = (pv_enum.GetValue() or "").upper()
                         # Some stacks use BTHENUM, others BTHHFENUM, etc.
                         is_bt = enumerator_name.startswith("BTH")
-                        log.info("Device '%s' enumerator='%s' is_bt=%s", name, enumerator_name, is_bt)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.debug("Enumerator detection failed for '%s': %s", name, exc)
+                    log.info("Device '%s' enumerator='%s' is_bt=%s", name, enumerator_name, is_bt)
 
                     default_id = (
                         default_output_id
