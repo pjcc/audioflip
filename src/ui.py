@@ -450,11 +450,17 @@ class DeviceDropdown(QWidget):
         devices = self._audio_mgr.enumerate_devices()
         active_ids = {d.id for d in devices}
 
-        # Backfill favourite_devices metadata for any active favourite
-        # that was added before the metadata feature existed.
+        # Backfill / refresh favourite_devices metadata for active favourites.
+        # Covers two cases:
+        #   (a) favourite was added before the metadata feature existed
+        #   (b) is_bluetooth was wrong when the favourite was saved (e.g. Dell/Intel
+        #       reporting INTELAUDIO before the name cross-ref fix)
         fav_metadata = self._config_mgr.get_favourite_devices()
         for dev in devices:
-            if self._config_mgr.is_favourite(dev.id) and dev.id not in fav_metadata:
+            if not self._config_mgr.is_favourite(dev.id):
+                continue
+            existing = fav_metadata.get(dev.id)
+            if existing is None:
                 log.info("Backfilling favourite metadata for '%s'", dev.name)
                 fav_metadata[dev.id] = {
                     "name": dev.name,
@@ -462,6 +468,10 @@ class DeviceDropdown(QWidget):
                     "is_bluetooth": dev.is_bluetooth,
                 }
                 self._config_mgr.config.favourite_devices[dev.id] = fav_metadata[dev.id]
+                self._config_mgr.save()
+            elif dev.is_bluetooth and not existing.get("is_bluetooth"):
+                log.info("Updating favourite metadata is_bluetooth for '%s'", dev.name)
+                existing["is_bluetooth"] = True
                 self._config_mgr.save()
 
         # Reconcile BT endpoint IDs: when a Bluetooth device reconnects it
@@ -493,12 +503,29 @@ class DeviceDropdown(QWidget):
             if fav_id not in active_ids:
                 meta = fav_metadata.get(fav_id)
                 if meta:
+                    is_bt = meta.get("is_bluetooth", False)
+                    ghost_name = meta.get("name", "Unknown")
+                    # Fallback: cross-ref against paired BT device names
+                    # (handles stale metadata from before BT detection fix)
+                    if not is_bt:
+                        try:
+                            from .bluetooth import get_paired_device_names
+                            gl = ghost_name.lower()
+                            for bt_name in get_paired_device_names():
+                                if bt_name.lower() in gl or gl in bt_name.lower():
+                                    is_bt = True
+                                    log.info("Ghost '%s' matched paired BT device '%s'", ghost_name, bt_name)
+                                    meta["is_bluetooth"] = True
+                                    self._config_mgr.save()
+                                    break
+                        except Exception:
+                            pass
                     ghost = AudioDevice(
                         id=fav_id,
-                        name=meta.get("name", "Unknown"),
+                        name=ghost_name,
                         flow=DeviceFlow(meta.get("flow", "output")),
                         is_default=False,
-                        is_bluetooth=meta.get("is_bluetooth", False),
+                        is_bluetooth=is_bt,
                         is_connected=False,
                     )
                     devices.append(ghost)
