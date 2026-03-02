@@ -41,9 +41,13 @@ def _setup_logging() -> None:
     logging.getLogger().addHandler(file_handler)
 
 
+log = logging.getLogger(__name__)
+
+
 def main() -> int:
     """Launch the audioflip widget."""
     _setup_logging()
+    log.info("audioflip starting")
 
     app = QApplication(sys.argv)
     app.setApplicationName("audioflip")
