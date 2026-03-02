@@ -393,6 +393,8 @@ class DeviceDropdown(QWidget):
         self._config_mgr = config_mgr
         self._rows_by_device_id: dict[str, DeviceRow] = {}
         self._bt_busy = False  # True while a BT op is in progress
+        self._last_show_mode = "output"
+        self._last_widget_height = 40
 
         # Opacity animation
         self._opacity = QGraphicsOpacityEffect(self)
@@ -426,8 +428,14 @@ class DeviceDropdown(QWidget):
             layout.addWidget(row)
             self._rows_by_device_id[dev.id] = row
 
-    def populate_and_show(self, anchor: QPoint, show_mode: str, widget_height: int = 40) -> None:
-        """Populate device list and show the dropdown near *anchor*."""
+    def populate_and_show(self, anchor: QPoint, show_mode: str, widget_height: int = 40, *, reposition: bool = True) -> None:
+        """Populate device list and show the dropdown near *anchor*.
+
+        When *reposition* is False the dropdown keeps its current position
+        (used for in-place refresh after a BT operation).
+        """
+        self._last_show_mode = show_mode
+        self._last_widget_height = widget_height
         # Clear previous content
         if self.layout():
             while self.layout().count():
@@ -594,23 +602,24 @@ class DeviceDropdown(QWidget):
         height = min(container.sizeHint().height() + 16, 420)
         self.setFixedSize(width, height)
 
-        x = anchor.x()
-        if grows_up:
-            y = anchor.y() - height - widget_height - 4
-        else:
-            y = anchor.y()
-        if x + width > screen_geo.right():
-            x = screen_geo.right() - width
-        if y < screen_geo.top():
-            y = screen_geo.top()
-        self.move(x, y)
+        if reposition:
+            x = anchor.x()
+            if grows_up:
+                y = anchor.y() - height - widget_height - 4
+            else:
+                y = anchor.y()
+            if x + width > screen_geo.right():
+                x = screen_geo.right() - width
+            if y < screen_geo.top():
+                y = screen_geo.top()
+            self.move(x, y)
 
-        # Fade in
-        self._opacity.setOpacity(0.0)
-        self.show()
-        self._anim.setStartValue(0.0)
-        self._anim.setEndValue(1.0)
-        self._anim.start()
+            # Fade in
+            self._opacity.setOpacity(0.0)
+            self.show()
+            self._anim.setStartValue(0.0)
+            self._anim.setEndValue(1.0)
+            self._anim.start()
 
     def _on_device_clicked(self, device: AudioDevice) -> None:
         if self._bt_busy:
@@ -641,17 +650,26 @@ class DeviceDropdown(QWidget):
             row.set_name_text(text)
 
     def show_bt_result(self, device_id: str, success: bool, action: str) -> None:
-        """Show BT operation result on the row.
+        """Handle BT operation result.
 
-        On success → update row text to confirm, keep dropdown open.
-        On failure → show failure text, keep dropdown open.
+        On success → repopulate with fresh device data so state is current.
+        On failure → show failure text on the row.
         """
         self._bt_busy = False
         if success:
-            label = "Connected ✓" if action == "connect" else "Disconnected ✓"
+            self._repopulate()
         else:
             label = "Connection failed" if action == "connect" else "Disconnect failed"
-        self._set_row_status(device_id, label)
+            self._set_row_status(device_id, label)
+
+    def _repopulate(self) -> None:
+        """Re-populate the dropdown in-place with fresh device data."""
+        self.populate_and_show(
+            self.pos(),
+            self._last_show_mode,
+            self._last_widget_height,
+            reposition=False,
+        )
 
     def _on_fav_toggled(self, device: AudioDevice) -> None:
         self.favourite_toggled.emit(device)
