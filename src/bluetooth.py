@@ -122,6 +122,7 @@ class BLUETOOTH_FIND_RADIO_PARAMS(ctypes.Structure):
 # ---------------------------------------------------------------------------
 _bt: ctypes.WinDLL | None = None
 _bt_available: bool | None = None
+_bt_auth_func = None  # BluetoothAuthenticateDeviceEx (may be in bthprops.cpl)
 _radio_handle: c_void_p | None = None
 
 
@@ -175,6 +176,34 @@ def _load_bt() -> ctypes.WinDLL | None:
         DWORD,
     ]
     dll.BluetoothSetServiceState.restype = DWORD
+
+    # BluetoothAuthenticateDeviceEx (SSP pairing for BT 2.1+)
+    # This function lives in bthprops.cpl on some Windows builds and may not
+    # be exported from BluetoothApis.dll.  Try the main dll first, then fall
+    # back to bthprops.cpl, and finally give up gracefully so core BT
+    # connect/disconnect still works even when pairing is unavailable.
+    global _bt_auth_func
+    _bt_auth_func = None
+    for _src in (dll, "bthprops.cpl"):
+        try:
+            _lib = _src if _src is dll else ctypes.WinDLL(_src)
+            _lib.BluetoothAuthenticateDeviceEx.argtypes = [
+                c_void_p,                       # hwndParentIn (NULL ok)
+                c_void_p,                       # hRadio
+                POINTER(BLUETOOTH_DEVICE_INFO), # pbtdiInout
+                c_void_p,                       # pbtOobData (NULL for SSP)
+                DWORD,                          # authenticationRequirement
+            ]
+            _lib.BluetoothAuthenticateDeviceEx.restype = DWORD
+            _bt_auth_func = _lib.BluetoothAuthenticateDeviceEx
+            log.info("BluetoothAuthenticateDeviceEx loaded from %s",
+                     "BluetoothApis.dll" if _src is dll else _src)
+            break
+        except (AttributeError, OSError):
+            continue
+    if _bt_auth_func is None:
+        log.warning("BluetoothAuthenticateDeviceEx not available — "
+                    "new-device pairing will be disabled")
 
     _bt = dll
     _bt_available = True
@@ -334,6 +363,163 @@ def _copy_device_info(src: BLUETOOTH_DEVICE_INFO) -> BLUETOOTH_DEVICE_INFO:
     dst = BLUETOOTH_DEVICE_INFO()
     memmove(byref(dst), byref(src), sizeof(BLUETOOTH_DEVICE_INFO))
     return dst
+
+
+# ---------------------------------------------------------------------------
+# Discovery & Pairing (for "Scan for Bluetooth" feature)
+# ---------------------------------------------------------------------------
+_AUDIO_VIDEO_MAJOR_CLASS = 0x04  # Bluetooth CoD major class: Audio/Video
+
+
+def discover_audio_devices(timeout_multiplier: int = 4) -> list[dict]:
+    """Scan for nearby Bluetooth audio devices (blocking ~5-12s).
+
+    Issues an active inquiry scan and filters results to Audio/Video
+    major class (0x04).  Returns a list of dicts:
+
+        {name, address, is_paired, _device_info}
+
+    ``is_paired`` is True if the device is already authenticated or
+    remembered.  ``_device_info`` holds the raw BLUETOOTH_DEVICE_INFO
+    struct for passing to ``pair_and_connect_device()``.
+    """
+    dll = _load_bt()
+    if dll is None:
+        log.warning("discover_audio_devices: BT APIs not available")
+        return []
+
+    radio = _get_radio_handle()
+
+    params = BLUETOOTH_DEVICE_SEARCH_PARAMS()
+    params.dwSize = sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS)
+    params.fReturnAuthenticated = True
+    params.fReturnRemembered = True
+    params.fReturnUnknown = True          # discover NEW devices
+    params.fReturnConnected = True
+    params.fIssueInquiry = True           # active scan
+    params.cTimeoutMultiplier = timeout_multiplier  # ~1.28s per unit
+    params.hRadio = radio
+
+    device_info = BLUETOOTH_DEVICE_INFO()
+    device_info.dwSize = sizeof(BLUETOOTH_DEVICE_INFO)
+
+    raw_devices: list[BLUETOOTH_DEVICE_INFO] = []
+
+    try:
+        h_find = dll.BluetoothFindFirstDevice(byref(params), byref(device_info))
+    except Exception as exc:
+        log.warning("discover_audio_devices: BluetoothFindFirstDevice exception: %s", exc)
+        return []
+
+    if not h_find:
+        err = ctypes.get_last_error()
+        log.info("discover_audio_devices: no devices found (last error: %d)", err)
+        return []
+
+    raw_devices.append(_copy_device_info(device_info))
+
+    while True:
+        next_info = BLUETOOTH_DEVICE_INFO()
+        next_info.dwSize = sizeof(BLUETOOTH_DEVICE_INFO)
+        try:
+            found = dll.BluetoothFindNextDevice(h_find, byref(next_info))
+        except Exception:
+            break
+        if not found:
+            break
+        raw_devices.append(_copy_device_info(next_info))
+
+    try:
+        dll.BluetoothFindDeviceClose(h_find)
+    except Exception:
+        pass
+
+    log.info("discover_audio_devices: found %d total devices", len(raw_devices))
+
+    # Filter to Audio/Video major class
+    results: list[dict] = []
+    for dev in raw_devices:
+        major = (dev.ulClassofDevice >> 8) & 0x1F
+        name = dev.szName.strip()
+        if major != _AUDIO_VIDEO_MAJOR_CLASS:
+            log.debug("  skipping '%s' (major class 0x%02X, not audio)", name, major)
+            continue
+        addr = ":".join(f"{b:02X}" for b in reversed(dev.Address.rgBytes[:6]))
+        is_paired = bool(dev.fAuthenticated) or bool(dev.fRemembered)
+        log.info("  audio device: '%s' addr=%s paired=%s connected=%s",
+                 name, addr, is_paired, bool(dev.fConnected))
+        results.append({
+            "name": name,
+            "address": addr,
+            "is_paired": is_paired,
+            "_device_info": dev,
+        })
+
+    log.info("discover_audio_devices: %d audio devices after filtering", len(results))
+    return results
+
+
+def pair_and_connect_device(device_info: BLUETOOTH_DEVICE_INFO) -> bool:
+    """Pair a discovered BT device and enable audio services (A2DP + HFP).
+
+    Uses BluetoothAuthenticateDeviceEx for Secure Simple Pairing.
+    After pairing, enables all audio service GUIDs via
+    BluetoothSetServiceState.
+
+    Returns True if pairing succeeded and at least one audio service
+    was enabled.
+    """
+    dll = _load_bt()
+    if dll is None:
+        return False
+
+    radio = _get_radio_handle()
+    dev_name = device_info.szName.strip()
+
+    # Already authenticated?
+    if not device_info.fAuthenticated:
+        if _bt_auth_func is None:
+            log.error("Cannot pair '%s' — BluetoothAuthenticateDeviceEx "
+                      "not available on this system", dev_name)
+            return False
+        # MITMProtectionNotRequiredGeneralBonding = 0x04
+        log.info("Pairing '%s' via BluetoothAuthenticateDeviceEx …", dev_name)
+        try:
+            result = _bt_auth_func(
+                None,                   # hwndParentIn
+                radio,                  # hRadio
+                byref(device_info),     # pbtdiInout
+                None,                   # pbtOobData (NULL → SSP)
+                DWORD(0x04),            # authenticationRequirement
+            )
+        except Exception as exc:
+            log.error("BluetoothAuthenticateDeviceEx exception for '%s': %s", dev_name, exc)
+            return False
+
+        if result != 0:
+            log.warning("BluetoothAuthenticateDeviceEx returned %d (0x%X) for '%s'",
+                        result, result, dev_name)
+            return False
+        log.info("Pairing succeeded for '%s'", dev_name)
+    else:
+        log.info("'%s' is already authenticated, skipping pairing", dev_name)
+
+    # Enable audio services
+    success = False
+    for guid in _AUDIO_SERVICE_GUIDS:
+        if _set_service_state(device_info, guid, enable=True):
+            success = True
+
+    # Invalidate paired names cache so next poll picks up the new device
+    global _paired_names_cache
+    _paired_names_cache = None
+
+    if success:
+        log.info("Audio services enabled for '%s'", dev_name)
+    else:
+        log.warning("No audio services could be enabled for '%s'", dev_name)
+
+    return success
 
 
 def _match_device_by_name(name: str) -> BLUETOOTH_DEVICE_INFO | None:
