@@ -58,7 +58,13 @@ from PyQt6.QtWidgets import (
 )
 
 from .audio_manager import AudioDevice, AudioManager, DeviceFlow
-from .bluetooth import bluetooth_connect, bluetooth_disconnect, is_bluetooth_available
+from .bluetooth import (
+    bluetooth_connect,
+    bluetooth_disconnect,
+    discover_audio_devices,
+    is_bluetooth_available,
+    pair_and_connect_device,
+)
 from .config import ConfigManager, VALID_THEMES
 from .icons import ICON_TYPES, IconManager, match_icon_for_name
 
@@ -629,17 +635,20 @@ class DeviceDropdown(QWidget):
             v_layout.addWidget(empty)
 
         # Scroll area
-        scroll = QScrollArea()
-        scroll.setWidget(container)
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.setMaximumHeight(400)
-        scroll.setStyleSheet(_scroll_stylesheet(t))
+        self._scroll = QScrollArea()
+        self._scroll.setWidget(container)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.setMaximumHeight(400)
+        self._scroll.setStyleSheet(_scroll_stylesheet(t))
+        # Install event filter on viewport so we can intercept wheel events
+        # and forward them to the parent widget for volume control
+        self._scroll.viewport().installEventFilter(self)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
+        outer.addWidget(self._scroll)
 
         # Size and position
         container.adjustSize()
@@ -737,6 +746,25 @@ class DeviceDropdown(QWidget):
         self.closed.emit()
         super().hideEvent(event)
 
+    def eventFilter(self, obj: object, event: QEvent) -> bool:
+        """Intercept wheel events on the scroll viewport and forward for volume."""
+        if (
+            hasattr(self, "_scroll")
+            and obj is self._scroll.viewport()
+            and event.type() == QEvent.Type.Wheel
+        ):
+            p = self.parent()
+            if p is not None:
+                p.wheelEvent(event)
+            return True  # consume — don't let scroll area scroll its content
+        return super().eventFilter(obj, event)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        """Forward scroll to parent widget so volume adjusts while open."""
+        p = self.parent()
+        if p is not None:
+            p.wheelEvent(event)
+
 
 # ---------------------------------------------------------------------------
 # _BodyWidget — widget body that paints a volume bar in its own paint cycle
@@ -832,6 +860,279 @@ class _BluetoothWorker(QObject):
         else:
             ok = bluetooth_disconnect(self._device_name)
         self.finished.emit(ok, self._action)
+
+
+# ---------------------------------------------------------------------------
+# _BtScanWorker — runs BT discovery off the UI thread
+# ---------------------------------------------------------------------------
+class _BtScanWorker(QObject):
+    """Performs Bluetooth device discovery in a background thread."""
+
+    finished = pyqtSignal(list)  # list of discovery dicts
+
+    def run(self) -> None:
+        results = discover_audio_devices(timeout_multiplier=4)
+        self.finished.emit(results)
+
+
+# ---------------------------------------------------------------------------
+# _BtPairWorker — runs BT pairing + service enablement off the UI thread
+# ---------------------------------------------------------------------------
+class _BtPairWorker(QObject):
+    """Pairs a discovered BT device and enables audio services."""
+
+    finished = pyqtSignal(bool, str)  # success, device_name
+
+    def __init__(self, device_info: object, device_name: str) -> None:
+        super().__init__()
+        self._device_info = device_info
+        self._device_name = device_name
+
+    def run(self) -> None:
+        ok = pair_and_connect_device(self._device_info)
+        self.finished.emit(ok, self._device_name)
+
+
+# ---------------------------------------------------------------------------
+# BluetoothScanDialog — popup for discovering & pairing BT audio devices
+# ---------------------------------------------------------------------------
+class BluetoothScanDialog(QWidget):
+    """Floating popup that scans for nearby BT audio devices and pairs them."""
+
+    pair_succeeded = pyqtSignal()  # emitted after a successful pair + connect
+
+    def __init__(self, config_mgr: ConfigManager, parent: QWidget | None = None) -> None:
+        super().__init__(
+            parent,
+            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._config_mgr = config_mgr
+        self._scan_thread: QThread | None = None
+        self._scan_worker: _BtScanWorker | None = None
+        self._pair_thread: QThread | None = None
+        self._pair_worker: _BtPairWorker | None = None
+        self._devices: list[dict] = []
+        self._row_widgets: list[tuple[QWidget, QLabel, QLabel]] = []  # (row, name_lbl, status_lbl)
+
+        t = _t(config_mgr)
+        self._theme = t
+        self._WIDTH = 280
+
+        # Main layout
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self._panel = QWidget()
+        self._panel.setStyleSheet(
+            f"background-color: {t['bg']};"
+            f"border: 1px solid {t['border']};"
+            f"border-radius: {_RADIUS}px;"
+        )
+        outer.addWidget(self._panel)
+
+        self._layout = QVBoxLayout(self._panel)
+        self._layout.setContentsMargins(12, 10, 12, 10)
+        self._layout.setSpacing(4)
+
+        # Title
+        title = QLabel("Scan for Bluetooth")
+        title.setStyleSheet(
+            f"color: {t['fg']}; font-weight: bold; font-size: 13px;"
+            "border: none; background: transparent;"
+        )
+        self._layout.addWidget(title)
+
+        # Status / scanning label
+        self._status_label = QLabel("Scanning\u2026")
+        self._status_label.setStyleSheet(
+            f"color: {t['fg_dim']}; font-size: 11px;"
+            "border: none; background: transparent;"
+        )
+        self._layout.addWidget(self._status_label)
+
+        # Scroll area for device rows
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(self._scroll.Shape.NoFrame)
+        self._scroll.setStyleSheet("background: transparent; border: none;")
+        self._scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        self._list_container = QWidget()
+        self._list_container.setStyleSheet("background: transparent; border: none;")
+        self._list_layout = QVBoxLayout(self._list_container)
+        self._list_layout.setContentsMargins(0, 0, 0, 0)
+        self._list_layout.setSpacing(2)
+        self._list_layout.addStretch()
+
+        self._scroll.setWidget(self._list_container)
+        self._scroll.hide()  # hidden until results arrive
+        self._layout.addWidget(self._scroll)
+
+        self.setFixedWidth(self._WIDTH)
+
+        # Start scanning immediately
+        self._start_scan()
+
+    # ------------------------------------------------------------------
+    # Scanning
+    # ------------------------------------------------------------------
+    def _start_scan(self) -> None:
+        self._scan_thread = QThread()
+        self._scan_worker = _BtScanWorker()
+        self._scan_worker.moveToThread(self._scan_thread)
+        self._scan_thread.started.connect(self._scan_worker.run)
+        self._scan_worker.finished.connect(self._on_scan_finished)
+        self._scan_worker.finished.connect(self._scan_thread.quit)
+        self._scan_thread.start()
+
+    def _on_scan_finished(self, results: list[dict]) -> None:
+        self._devices = results
+
+        # Filter to unpaired only for display, but show paired ones dimmed
+        unpaired = [d for d in results if not d["is_paired"]]
+
+        if not unpaired and not results:
+            self._status_label.setText("No audio devices found")
+            self._status_label.show()
+            self.adjustSize()
+            self._apply_mask()
+            return
+
+        if not unpaired:
+            self._status_label.setText("No new audio devices found")
+            self._status_label.show()
+            self.adjustSize()
+            self._apply_mask()
+            return
+
+        self._status_label.hide()
+        self._scroll.show()
+
+        t = self._theme
+        for dev in unpaired:
+            name = dev["name"] or "Unknown"
+
+            row = QWidget()
+            row.setFixedHeight(32)
+            row.setCursor(Qt.CursorShape.PointingHandCursor)
+            row.setStyleSheet(
+                "background: transparent; border: none; border-radius: 4px;"
+            )
+
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(6, 0, 6, 0)
+            rl.setSpacing(6)
+
+            name_lbl = QLabel(name)
+            name_lbl.setStyleSheet(
+                f"color: {t['fg']}; font-size: 12px;"
+                "border: none; background: transparent;"
+            )
+            rl.addWidget(name_lbl, stretch=1)
+
+            status_lbl = QLabel("")
+            status_lbl.setStyleSheet(
+                f"color: {t['fg_dim']}; font-size: 10px;"
+                "border: none; background: transparent;"
+            )
+            status_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            rl.addWidget(status_lbl)
+
+            # Make clickable via mousePressEvent
+            row.mousePressEvent = lambda e, d=dev, s=status_lbl: self._on_device_clicked(d, s)
+            row.enterEvent = lambda e, r=row, th=t: r.setStyleSheet(
+                f"background: {th['bg_hover']}; border: none; border-radius: 4px;"
+            )
+            row.leaveEvent = lambda e, r=row: r.setStyleSheet(
+                "background: transparent; border: none; border-radius: 4px;"
+            )
+
+            # Insert before the stretch
+            self._list_layout.insertWidget(self._list_layout.count() - 1, row)
+            self._row_widgets.append((row, name_lbl, status_lbl))
+
+        # Set sensible height — up to 5 rows visible
+        n_rows = len(unpaired)
+        row_h = 32
+        max_visible = min(n_rows, 5)
+        self._scroll.setFixedHeight(max_visible * row_h + 8)
+
+        self.adjustSize()
+        self._apply_mask()
+
+    # ------------------------------------------------------------------
+    # Pairing
+    # ------------------------------------------------------------------
+    def _on_device_clicked(self, dev: dict, status_lbl: QLabel) -> None:
+        """User clicked an unpaired device — pair it."""
+        if self._pair_thread is not None:
+            return  # already pairing
+
+        status_lbl.setText("Pairing\u2026")
+        status_lbl.setStyleSheet(
+            f"color: {self._theme['fg_dim']}; font-size: 10px;"
+            "border: none; background: transparent;"
+        )
+
+        # Disable all row click handlers during pairing
+        for row, _, _ in self._row_widgets:
+            row.setCursor(Qt.CursorShape.WaitCursor)
+
+        device_info = dev["_device_info"]
+        device_name = dev["name"]
+
+        self._pair_thread = QThread()
+        self._pair_worker = _BtPairWorker(device_info, device_name)
+        self._pair_worker.moveToThread(self._pair_thread)
+        self._pair_thread.started.connect(self._pair_worker.run)
+        self._pair_worker.finished.connect(
+            lambda ok, name, s=status_lbl: self._on_pair_finished(ok, name, s)
+        )
+        self._pair_worker.finished.connect(self._pair_thread.quit)
+        self._pair_thread.start()
+
+    def _on_pair_finished(self, success: bool, device_name: str, status_lbl: QLabel) -> None:
+        if success:
+            status_lbl.setText("Connected \u2713")
+            status_lbl.setStyleSheet(
+                "color: #4CAF50; font-size: 10px; font-weight: bold;"
+                "border: none; background: transparent;"
+            )
+            self.pair_succeeded.emit()
+            # Close dialog after a brief moment
+            QTimer.singleShot(1200, self.close)
+        else:
+            status_lbl.setText("Failed")
+            status_lbl.setStyleSheet(
+                "color: #E57373; font-size: 10px;"
+                "border: none; background: transparent;"
+            )
+            # Re-enable clicking
+            for row, _, _ in self._row_widgets:
+                row.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._pair_thread = None
+            self._pair_worker = None
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _apply_mask(self) -> None:
+        """Apply rounded-corner mask after size change."""
+        QTimer.singleShot(0, lambda: self.setMask(
+            _rounded_mask(self.width(), self.height(), _RADIUS)
+        ))
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        """Forward scroll to parent widget so volume adjusts while open."""
+        p = self.parent()
+        if p is not None:
+            p.wheelEvent(event)
 
 
 # ---------------------------------------------------------------------------
@@ -985,6 +1286,39 @@ class AudioFlipWidget(QWidget):
         self._config_mgr.set_position(x, y)
         self.show()
         self._apply_always_on_top(self._config_mgr.config.always_on_top)
+
+    # --- Bluetooth scan dialog ---------------------------------------------
+
+    def _open_bt_scan_dialog(self) -> None:
+        """Open the Bluetooth scan popup near the widget."""
+        # Clean up previous dialog if any
+        if hasattr(self, "_bt_scan_dialog") and self._bt_scan_dialog is not None:
+            self._bt_scan_dialog.close()
+            self._bt_scan_dialog.deleteLater()
+
+        dialog = BluetoothScanDialog(self._config_mgr, parent=self)
+        self._bt_scan_dialog = dialog  # prevent GC during async scan
+        dialog.pair_succeeded.connect(self._on_bt_scan_pair_succeeded)
+
+        # Position: same logic as dropdown / context menu
+        screen_geo = QApplication.primaryScreen().availableGeometry()
+        dlg_size = dialog.sizeHint()
+        anchor_below = self.mapToGlobal(QPoint(0, self.height() + 4))
+        anchor_above = self.mapToGlobal(QPoint(0, -dlg_size.height() - 4))
+        if anchor_below.y() + dlg_size.height() <= screen_geo.bottom():
+            show_pos = anchor_below
+        else:
+            show_pos = anchor_above
+        if show_pos.x() + dlg_size.width() > screen_geo.right():
+            show_pos.setX(screen_geo.right() - dlg_size.width())
+        dialog.move(show_pos)
+        dialog.show()
+
+    def _on_bt_scan_pair_succeeded(self) -> None:
+        """Called when a BT scan dialog successfully pairs a device."""
+        log.info("BT scan: pair succeeded, refreshing display")
+        # Give Windows a moment to register the new audio endpoint
+        QTimer.singleShot(2000, self._refresh_display)
 
     # --- Border flash animation -------------------------------------------
 
@@ -1500,6 +1834,13 @@ class AudioFlipWidget(QWidget):
         move_action.triggered.connect(self._move_to_screen)
         menu.addAction(move_action)
 
+        # Scan for Bluetooth (only if BT hardware available)
+        if is_bluetooth_available():
+            menu.addSeparator()
+            scan_action = QAction("Scan for bluetooth", self)
+            scan_action.triggered.connect(self._open_bt_scan_dialog)
+            menu.addAction(scan_action)
+
         menu.addSeparator()
 
         # Quit
@@ -1546,9 +1887,13 @@ class AudioFlipWidget(QWidget):
         self._ctx_menu.popup(show_pos)
 
     def eventFilter(self, obj: object, event: QEvent) -> bool:
-        """Elevate QMenu popups to HWND_TOPMOST so they appear above this widget."""
+        """Elevate QMenu popups to HWND_TOPMOST and forward wheel events."""
         if isinstance(obj, QMenu) and event.type() == QEvent.Type.Show:
             QTimer.singleShot(0, lambda m=obj: self._elevate_menu(m))
+        # Forward wheel events from menus so volume scroll works while open
+        if isinstance(obj, QMenu) and event.type() == QEvent.Type.Wheel:
+            self.wheelEvent(event)
+            return True
         return super().eventFilter(obj, event)
 
     def _elevate_menu(self, menu: QMenu) -> None:
