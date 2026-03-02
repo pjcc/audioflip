@@ -28,6 +28,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QAction,
+    QBitmap,
     QColor,
     QCursor,
     QFont,
@@ -207,6 +208,19 @@ _THEMES: dict[str, dict[str, str]] = {
 
 _RADIUS = 10
 _FONT_FAMILY = "Segoe UI"
+
+
+def _rounded_mask(width: int, height: int, radius: int) -> QBitmap:
+    """Create a pixel-perfect rounded-rect mask via QBitmap + QPainter."""
+    bmp = QBitmap(width, height)
+    bmp.fill(Qt.GlobalColor.color0)  # fully transparent
+    p = QPainter(bmp)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+    p.setBrush(Qt.GlobalColor.color1)  # opaque
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawRoundedRect(0, 0, width, height, radius, radius)
+    p.end()
+    return bmp
 
 
 def _t(config_mgr: ConfigManager) -> dict[str, str]:
@@ -634,9 +648,7 @@ class DeviceDropdown(QWidget):
         self.setFixedSize(width, height)
 
         # Apply rounded mask to clip the native window corners
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(0, 0, width, height), _RADIUS, _RADIUS)
-        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+        self.setMask(_rounded_mask(width, height, _RADIUS))
 
         if reposition:
             x = anchor.x()
@@ -859,6 +871,7 @@ class AudioFlipWidget(QWidget):
         self._bt_pending_device_id: str | None = None  # old device ID (may be stale after reconnect)
         self._bt_pending_device_name: str | None = None  # device name for name-based fallback
         self._bt_active_device_id: str | None = None  # device ID the dropdown is showing status for
+        self._bt_retry_name: str | None = None  # kept for the 4s retry (not cleared by _set_pending)
 
         # Build body container
         self._body = _BodyWidget(self)
@@ -1214,6 +1227,8 @@ class AudioFlipWidget(QWidget):
                 self._dropdown.show_bt_result(device_id or "", False, action)
 
         if action == "connect" and success:
+            # Save device name for the 4s retry (survives _set_pending clearing)
+            self._bt_retry_name = self._bt_pending_device_name
             # Wait for Windows to register the new endpoint, then switch
             QTimer.singleShot(1500, self._set_pending_bt_device)
             # Secondary refresh for slow BT stacks (e.g. Dell/Intel)
@@ -1230,6 +1245,7 @@ class AudioFlipWidget(QWidget):
             self._bt_pending_device_id = None
             self._bt_pending_device_name = None
             self._bt_active_device_id = None
+            self._bt_retry_name = None
             QTimer.singleShot(2000, self._refresh_display)
 
     def _set_pending_bt_device(self) -> None:
@@ -1249,23 +1265,38 @@ class AudioFlipWidget(QWidget):
             # Try the stored ID first
             ok = self._audio_mgr.set_default_device(dev_id)
             if not ok and dev_name:
-                # ID is stale — find the new endpoint by name
+                # ID is stale — find the new endpoint by name (BT-flagged first)
                 log.info("Old device ID failed, searching by name: '%s'", dev_name)
                 new_dev = self._find_bt_device_by_name(dev_name)
+                if not new_dev:
+                    # Broaden: search ALL devices by name (Dell/Intel may not
+                    # flag the endpoint as BT yet at 1.5s)
+                    new_dev = self._find_device_by_name(dev_name)
                 if new_dev:
                     log.info("Found new endpoint: '%s' (%s)", new_dev.name, new_dev.id)
                     ok = self._audio_mgr.set_default_device(new_dev.id)
                 else:
-                    log.warning("No active BT endpoint found matching '%s'", dev_name)
+                    log.warning("No active endpoint found matching '%s'", dev_name)
+
+            # Check if Windows already switched the default (BT stack auto-switch)
+            if not ok and dev_name:
+                devices = self._audio_mgr.enumerate_devices()
+                auto_switched = any(
+                    d.is_default and _bt_names_match(d.name, dev_name)
+                    for d in devices
+                )
+                if auto_switched:
+                    log.info("Windows auto-switched default to '%s'", dev_name)
+                    ok = True
+
             if ok:
                 if self._dropdown and self._dropdown.isVisible():
                     self._dropdown.show_bt_result(dropdown_device_id or "", True, "connect")
             else:
+                # Don't show failure — the 4s retry may still succeed
+                log.info("1.5s switch attempt inconclusive for '%s', 4s retry pending", dev_name)
                 if self._dropdown and self._dropdown.isVisible():
-                    self._dropdown.show_bt_result(dropdown_device_id or "", False, "connect")
-                self._name_label.setText("Switch failed")
-                QTimer.singleShot(2000, self._refresh_display)
-                return
+                    self._dropdown._set_row_status(dropdown_device_id or "", "Switching\u2026")
 
         self._refresh_display()
 
@@ -1273,9 +1304,37 @@ class AudioFlipWidget(QWidget):
         """Secondary refresh for slow BT stacks (Dell/Intel).
 
         Runs ~4s after BT connect to catch delayed endpoint registration.
-        Re-scans devices and, if a matching BT endpoint exists that isn't
-        default yet, sets it as default and refreshes the dropdown.
+        If the BT device still isn't the default, re-attempt setting it.
         """
+        retry_name = self._bt_retry_name
+        self._bt_retry_name = None
+
+        if retry_name:
+            # Check if the BT device is already the default (match by name
+            # only — don't require is_bluetooth since Dell/Intel stacks may
+            # not flag the endpoint as BT until the paired-device cache refreshes)
+            devices = self._audio_mgr.enumerate_devices()
+            already_default = any(
+                d.is_default and _bt_names_match(d.name, retry_name)
+                for d in devices
+            )
+            if not already_default:
+                # Search ALL devices by name (not just those flagged as BT)
+                target = next(
+                    (d for d in devices if _bt_names_match(d.name, retry_name)),
+                    None,
+                )
+                if target:
+                    log.info(
+                        "4s retry: setting device as default: '%s' (%s)",
+                        target.name, target.id,
+                    )
+                    self._audio_mgr.set_default_device(target.id)
+                else:
+                    log.warning("4s retry: no endpoint found matching '%s'", retry_name)
+            else:
+                log.info("4s retry: '%s' is already the default", retry_name)
+
         self._refresh_display()
         if self._dropdown and self._dropdown.isVisible():
             self._dropdown._repopulate()
@@ -1284,6 +1343,13 @@ class AudioFlipWidget(QWidget):
         """Find an active BT audio device whose name matches the given name."""
         for dev in self._audio_mgr.enumerate_devices():
             if dev.is_bluetooth and _bt_names_match(dev.name, name):
+                return dev
+        return None
+
+    def _find_device_by_name(self, name: str) -> AudioDevice | None:
+        """Find any active audio device whose name matches (BT or not)."""
+        for dev in self._audio_mgr.enumerate_devices():
+            if _bt_names_match(dev.name, name):
                 return dev
         return None
 
@@ -1490,9 +1556,7 @@ class AudioFlipWidget(QWidget):
         try:
             # Apply rounded mask to clip the native window corners
             sz = menu.size()
-            path = QPainterPath()
-            path.addRoundedRect(QRectF(0, 0, sz.width(), sz.height()), 6, 6)
-            menu.setMask(QRegion(path.toFillPolygon().toPolygon()))
+            menu.setMask(_rounded_mask(sz.width(), sz.height(), 6))
 
             menu_hwnd = int(menu.winId())
             if menu_hwnd:
