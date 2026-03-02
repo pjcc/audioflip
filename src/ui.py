@@ -383,6 +383,7 @@ class DeviceRow(QWidget):
             self.clicked.emit(self.device)
         elif event.button() == Qt.MouseButton.RightButton:
             self.fav_toggled.emit(self.device)
+        event.accept()  # prevent click-through to windows behind the popup
 
 
 # ---------------------------------------------------------------------------
@@ -1697,13 +1698,13 @@ class AudioFlipWidget(QWidget):
             self._bt_thread = None
 
     def _on_fav_toggled_dropdown(self, device: AudioDevice) -> None:
-        """Toggle favourite for a device, then refresh the dropdown."""
+        """Toggle favourite for a device, then refresh the dropdown in-place."""
         self._config_mgr.toggle_favourite(
             device.id, device.name, device.flow.value, device.is_bluetooth,
         )
-        # Re-open to reflect change — reset timestamp so the re-open isn't suppressed
-        self._dropdown_closed_at = 0.0
-        self._open_dropdown()
+        # Repopulate in-place — avoids close/reopen flicker and click-through
+        if hasattr(self, "_dropdown") and self._dropdown.isVisible():
+            self._dropdown._repopulate()
 
     def _on_dropdown_closed(self) -> None:
         """Record when the dropdown closes so we can suppress immediate reopen."""
