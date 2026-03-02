@@ -17,6 +17,7 @@ a = Analysis(
         'comtypes.stream',
         'pycaw',
         'pycaw.pycaw',
+        'src.bluetooth',
     ],
     hookspath=[],
     hooksconfig={},

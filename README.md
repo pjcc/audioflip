@@ -52,6 +52,10 @@ python -m venv .venv
 
 ## Building a Standalone .exe
 ```powershell
+# Clean out old build artefacts and cache
+Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
+
+# Rebuild
 .venv\Scripts\python.exe -m PyInstaller audioflip.spec
 ```
 
