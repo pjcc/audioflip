@@ -395,6 +395,7 @@ class DeviceDropdown(QWidget):
         self._bt_busy = False  # True while a BT op is in progress
         self._last_show_mode = "output"
         self._last_widget_height = 40
+        self._favs_at_end = False
 
         # Opacity animation
         self._opacity = QGraphicsOpacityEffect(self)
@@ -517,10 +518,12 @@ class DeviceDropdown(QWidget):
             row_count += len(inputs) + 1
         est_height = min(row_count * 38 + 50, 420)
         screen_geo = QApplication.primaryScreen().availableGeometry()
-        grows_up = (anchor.y() + est_height) > screen_geo.bottom()
-        # When grows_up: favourites at bottom (closer to widget) = closer to cursor
-        # When grows_down: favourites at top (closer to widget) = closer to cursor
-        favs_at_end = grows_up
+        if reposition:
+            grows_up = (anchor.y() + est_height) > screen_geo.bottom()
+            # When grows_up: favourites at bottom (closer to widget) = closer to cursor
+            # When grows_down: favourites at top (closer to widget) = closer to cursor
+            self._favs_at_end = grows_up
+        favs_at_end = self._favs_at_end
 
         container = QWidget()
         container.setObjectName("Dropdown")
