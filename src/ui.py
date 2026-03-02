@@ -641,18 +641,17 @@ class DeviceDropdown(QWidget):
             row.set_name_text(text)
 
     def show_bt_result(self, device_id: str, success: bool, action: str) -> None:
-        """Show BT operation result on the row, then close or reset.
+        """Show BT operation result on the row.
 
-        On success → close dropdown after a short delay.
-        On failure → show failure text, then close after 2 seconds.
+        On success → update row text to confirm, keep dropdown open.
+        On failure → show failure text, keep dropdown open.
         """
         self._bt_busy = False
         if success:
-            self._fade_out_and_close()
+            label = "Connected ✓" if action == "connect" else "Disconnected ✓"
         else:
             label = "Connection failed" if action == "connect" else "Disconnect failed"
-            self._set_row_status(device_id, label)
-            QTimer.singleShot(2000, self._fade_out_and_close)
+        self._set_row_status(device_id, label)
 
     def _on_fav_toggled(self, device: AudioDevice) -> None:
         self.favourite_toggled.emit(device)
