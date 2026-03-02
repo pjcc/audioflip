@@ -640,8 +640,8 @@ class DeviceDropdown(QWidget):
             self.bt_connect_requested.emit(device)
             return
 
-        # BT disconnect: connected BT device → keep dropdown open
-        if device.is_bluetooth and device.is_connected:
+        # BT disconnect: only when it's already the active (default) device
+        if device.is_bluetooth and device.is_connected and device.is_default:
             self._bt_busy = True
             self._set_row_status(device.id, "Disconnecting\u2026")
             self.bt_disconnect_requested.emit(device)
