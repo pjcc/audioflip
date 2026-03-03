@@ -51,5 +51,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,  # Add an .ico file here if desired
+    icon='resources/audioflip.ico',
 )
