@@ -1,0 +1,66 @@
+2026-02-28 11:22:35,841 [INFO] src.bluetooth: Bluetooth APIs loaded successfully
+2026-02-28 11:22:35,844 [INFO] src.bluetooth: Enumerated 5 paired Bluetooth devices
+2026-02-28 11:22:35,845 [INFO] src.bluetooth: Trying to match audio name 'Earphones (Buds Pro 2)' against 5 paired BT devices
+2026-02-28 11:22:35,846 [INFO] src.bluetooth: Matched BT device 'Buds Pro 2' (substring of audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:22:35,847 [INFO] src.bluetooth: Disconnecting BT device: 'Buds Pro 2' (matched from audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:22:39,005 [INFO] src.bluetooth: BluetoothSetServiceState(disable) succeeded for 'Buds Pro 2'
+2026-02-28 11:22:42,192 [INFO] src.bluetooth: BluetoothSetServiceState(disable) succeeded for 'Buds Pro 2'
+2026-02-28 11:22:42,194 [WARNING] src.bluetooth: BluetoothSetServiceState(disable) returned error 1060 (0x424) for 'Buds Pro 2'
+2026-02-28 11:22:42,195 [INFO] src.bluetooth: BT disconnect result for 'Earphones (Buds Pro 2)': success
+2026-02-28 11:24:10,155 [INFO] src.bluetooth: Enumerated 5 paired Bluetooth devices
+2026-02-28 11:24:10,158 [INFO] src.bluetooth: Trying to match audio name 'Earphones (Buds Pro 2)' against 5 paired BT devices
+2026-02-28 11:24:10,158 [INFO] src.bluetooth: Matched BT device 'Buds Pro 2' (substring of audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:24:10,159 [INFO] src.bluetooth: Disconnecting BT device: 'Buds Pro 2' (matched from audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:24:13,277 [INFO] src.bluetooth: BluetoothSetServiceState(disable) succeeded for 'Buds Pro 2'
+2026-02-28 11:24:16,458 [INFO] src.bluetooth: BluetoothSetServiceState(disable) succeeded for 'Buds Pro 2'
+2026-02-28 11:24:16,459 [WARNING] src.bluetooth: BluetoothSetServiceState(disable) returned error 1060 (0x424) for 'Buds Pro 2'
+2026-02-28 11:24:16,459 [INFO] src.bluetooth: BT disconnect result for 'Earphones (Buds Pro 2)': success
+2026-02-28 11:24:24,984 [INFO] src.bluetooth: Enumerated 5 paired Bluetooth devices
+2026-02-28 11:24:24,984 [INFO] src.bluetooth: Trying to match audio name 'Earphones (Buds Pro 2)' against 5 paired BT devices
+2026-02-28 11:24:24,984 [INFO] src.bluetooth: Matched BT device 'Buds Pro 2' (substring of audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:24:24,984 [INFO] src.bluetooth: Connecting BT device: 'Buds Pro 2' (matched from audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:24:28,003 [INFO] src.bluetooth: BluetoothSetServiceState(enable) succeeded for 'Buds Pro 2'
+2026-02-28 11:24:31,011 [INFO] src.bluetooth: BluetoothSetServiceState(enable) succeeded for 'Buds Pro 2'
+2026-02-28 11:24:31,013 [WARNING] src.bluetooth: BluetoothSetServiceState(enable) returned error 1060 (0x424) for 'Buds Pro 2'
+2026-02-28 11:24:31,013 [INFO] src.bluetooth: BT connect result for 'Earphones (Buds Pro 2)': success
+2026-02-28 11:24:33,450 [INFO] src.bluetooth: Enumerated 5 paired Bluetooth devices
+2026-02-28 11:24:33,450 [INFO] src.bluetooth: Trying to match audio name 'Earphones (Buds Pro 2)' against 5 paired BT devices
+2026-02-28 11:24:33,450 [INFO] src.bluetooth: Matched BT device 'Buds Pro 2' (substring of audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:24:33,451 [INFO] src.bluetooth: Connecting BT device: 'Buds Pro 2' (matched from audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:24:33,454 [WARNING] src.bluetooth: BluetoothSetServiceState(enable) returned error 87 (0x57) for 'Buds Pro 2'
+2026-02-28 11:24:33,456 [WARNING] src.bluetooth: BluetoothSetServiceState(enable) returned error 87 (0x57) for 'Buds Pro 2'
+2026-02-28 11:24:33,457 [WARNING] src.bluetooth: BluetoothSetServiceState(enable) returned error 1060 (0x424) for 'Buds Pro 2'
+2026-02-28 11:24:33,457 [INFO] src.bluetooth: BT connect result for 'Earphones (Buds Pro 2)': FAILED
+2026-02-28 11:24:36,845 [INFO] src.bluetooth: Enumerated 5 paired Bluetooth devices
+2026-02-28 11:24:36,846 [INFO] src.bluetooth: Trying to match audio name 'Headphones (Buds Pro 2)' against 5 paired BT devices
+2026-02-28 11:24:36,846 [INFO] src.bluetooth: Matched BT device 'Buds Pro 2' (substring of audio name 'Headphones (Buds Pro 2)')
+2026-02-28 11:24:36,846 [INFO] src.bluetooth: Disconnecting BT device: 'Buds Pro 2' (matched from audio name 'Headphones (Buds Pro 2)')
+2026-02-28 11:24:39,958 [INFO] src.bluetooth: BluetoothSetServiceState(disable) succeeded for 'Buds Pro 2'
+2026-02-28 11:24:43,141 [INFO] src.bluetooth: BluetoothSetServiceState(disable) succeeded for 'Buds Pro 2'
+2026-02-28 11:24:43,143 [WARNING] src.bluetooth: BluetoothSetServiceState(disable) returned error 1060 (0x424) for 'Buds Pro 2'
+2026-02-28 11:24:43,145 [INFO] src.bluetooth: BT disconnect result for 'Headphones (Buds Pro 2)': success
+2026-02-28 11:24:45,349 [INFO] src.bluetooth: Enumerated 5 paired Bluetooth devices
+2026-02-28 11:24:45,353 [INFO] src.bluetooth: Trying to match audio name 'Earphones (Buds Pro 2)' against 5 paired BT devices
+2026-02-28 11:24:45,353 [INFO] src.bluetooth: Matched BT device 'Buds Pro 2' (substring of audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:24:45,353 [INFO] src.bluetooth: Connecting BT device: 'Buds Pro 2' (matched from audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:24:48,359 [INFO] src.bluetooth: BluetoothSetServiceState(enable) succeeded for 'Buds Pro 2'
+2026-02-28 11:24:51,378 [INFO] src.bluetooth: BluetoothSetServiceState(enable) succeeded for 'Buds Pro 2'
+2026-02-28 11:24:51,379 [WARNING] src.bluetooth: BluetoothSetServiceState(enable) returned error 1060 (0x424) for 'Buds Pro 2'
+2026-02-28 11:24:51,380 [INFO] src.bluetooth: BT connect result for 'Earphones (Buds Pro 2)': success
+2026-02-28 11:24:52,880 [ERROR] src.audio_manager: Failed to set default device {0.0.0.00000000}.{d9309ac0-8a29-458d-a497-316d1faca995}: (-2147023728, 'Element not found.', (None, None, None, 0, None))
+2026-02-28 11:26:59,911 [INFO] src.bluetooth: Enumerated 5 paired Bluetooth devices
+2026-02-28 11:26:59,921 [INFO] src.bluetooth: Trying to match audio name 'Earphones (Buds Pro 2)' against 5 paired BT devices
+2026-02-28 11:26:59,921 [INFO] src.bluetooth: Matched BT device 'Buds Pro 2' (substring of audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:26:59,921 [INFO] src.bluetooth: Connecting BT device: 'Buds Pro 2' (matched from audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:26:59,924 [WARNING] src.bluetooth: BluetoothSetServiceState(enable) returned error 87 (0x57) for 'Buds Pro 2'
+2026-02-28 11:26:59,929 [WARNING] src.bluetooth: BluetoothSetServiceState(enable) returned error 87 (0x57) for 'Buds Pro 2'
+2026-02-28 11:26:59,930 [WARNING] src.bluetooth: BluetoothSetServiceState(enable) returned error 1060 (0x424) for 'Buds Pro 2'
+2026-02-28 11:26:59,930 [INFO] src.bluetooth: BT connect result for 'Earphones (Buds Pro 2)': FAILED
+2026-02-28 11:27:46,173 [INFO] src.bluetooth: Enumerated 5 paired Bluetooth devices
+2026-02-28 11:27:46,177 [INFO] src.bluetooth: Trying to match audio name 'Earphones (Buds Pro 2)' against 5 paired BT devices
+2026-02-28 11:27:46,177 [INFO] src.bluetooth: Matched BT device 'Buds Pro 2' (substring of audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:27:46,177 [INFO] src.bluetooth: Connecting BT device: 'Buds Pro 2' (matched from audio name 'Earphones (Buds Pro 2)')
+2026-02-28 11:27:46,180 [WARNING] src.bluetooth: BluetoothSetServiceState(enable) returned error 87 (0x57) for 'Buds Pro 2'
+2026-02-28 11:27:46,183 [WARNING] src.bluetooth: BluetoothSetServiceState(enable) returned error 87 (0x57) for 'Buds Pro 2'
+2026-02-28 11:27:46,184 [WARNING] src.bluetooth: BluetoothSetServiceState(enable) returned error 1060 (0x424) for 'Buds Pro 2'
+2026-02-28 11:27:46,184 [INFO] src.bluetooth: BT connect result for 'Earphones (Buds Pro 2)': FAILED

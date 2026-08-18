@@ -42,6 +42,7 @@ class Config:
     favourite_devices: dict[str, dict] = field(default_factory=dict)  # {id: {name, flow, is_bluetooth}}
     flash_on_change: bool = True
     show_volume_bar: bool = False
+    yield_to_fullscreen: bool = True  # drop topmost while a fullscreen app is active
 
     def __post_init__(self) -> None:
         if self.show_mode not in ("output", "input", "both"):
@@ -100,6 +101,7 @@ class ConfigManager:
                 favourite_devices=data.get("favourite_devices", {}),
                 flash_on_change=data.get("flash_on_change", True),
                 show_volume_bar=data.get("show_volume_bar", False),
+                yield_to_fullscreen=data.get("yield_to_fullscreen", True),
             )
         except (json.JSONDecodeError, KeyError, TypeError):
             return Config()
@@ -212,6 +214,10 @@ class ConfigManager:
 
     def set_show_volume_bar(self, value: bool) -> None:
         self._config.show_volume_bar = value
+        self.save()
+
+    def set_yield_to_fullscreen(self, value: bool) -> None:
+        self._config.yield_to_fullscreen = value
         self.save()
 
     @staticmethod

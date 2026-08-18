@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -115,6 +116,154 @@ _SWP_NOACTIVATE = 0x0010
 _SWP_SHOWWINDOW = 0x0040
 _HWND_TOPMOST = ctypes.wintypes.HWND(-1)
 _HWND_NOTOPMOST = ctypes.wintypes.HWND(-2)
+
+# ---------------------------------------------------------------------------
+# Fullscreen detection (Win32)
+# ---------------------------------------------------------------------------
+_MONITOR_DEFAULTTONEAREST = 0x0002
+_FULLSCREEN_TOLERANCE_PX = 2   # some apps miss the monitor rect by a pixel
+_FULLSCREEN_CLEAR_TICKS = 2    # consecutive clear polls before restoring topmost
+
+# Desktop and shell windows cover the whole monitor at all times and must
+# never count as a fullscreen app.
+_EXCLUDED_FULLSCREEN_CLASSES = frozenset({
+    "Progman",                  # desktop
+    "WorkerW",                  # desktop wallpaper host
+    "Shell_TrayWnd",            # taskbar
+    "Shell_SecondaryTrayWnd",   # taskbar on secondary monitors
+    "Windows.UI.Core.CoreWindow",  # shell surfaces (Start, search)
+})
+
+# SHQueryUserNotificationState results worth treating as fullscreen
+_QUNS_RUNNING_D3D_FULL_SCREEN = 3
+_QUNS_PRESENTATION_MODE = 4
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("rcMonitor", ctypes.wintypes.RECT),
+        ("rcWork", ctypes.wintypes.RECT),
+        ("dwFlags", ctypes.wintypes.DWORD),
+    ]
+
+
+def _setup_fullscreen_prototypes() -> None:
+    """Declare argtypes/restypes so handles survive on 64-bit."""
+    _user32.GetForegroundWindow.restype = ctypes.wintypes.HWND
+    _user32.GetShellWindow.restype = ctypes.wintypes.HWND
+    _user32.GetDesktopWindow.restype = ctypes.wintypes.HWND
+    _user32.GetWindowRect.argtypes = [ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.RECT)]
+    _user32.GetWindowRect.restype = ctypes.wintypes.BOOL
+    _user32.MonitorFromWindow.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.DWORD]
+    _user32.MonitorFromWindow.restype = ctypes.c_void_p
+    _user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
+    _user32.GetMonitorInfoW.restype = ctypes.wintypes.BOOL
+    _user32.GetClassNameW.argtypes = [
+        ctypes.wintypes.HWND, ctypes.wintypes.LPWSTR, ctypes.c_int,
+    ]
+    _user32.GetClassNameW.restype = ctypes.c_int
+    _user32.GetWindowThreadProcessId.argtypes = [
+        ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.DWORD),
+    ]
+    _user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+
+
+_setup_fullscreen_prototypes()
+_OWN_PID = os.getpid()
+
+
+def covers_monitor(
+    window: tuple[int, int, int, int], monitor: tuple[int, int, int, int]
+) -> bool:
+    """Return True if *window* covers the whole of *monitor*.
+
+    Both are Win32-style (left, top, right, bottom) with exclusive right and
+    bottom edges - deliberately not QRect, whose right()/bottom() are
+    inclusive and would introduce an off-by-one against Win32 RECTs.
+
+    A small tolerance absorbs apps that miss the monitor edge by a pixel.
+    """
+    tol = _FULLSCREEN_TOLERANCE_PX
+    w_left, w_top, w_right, w_bottom = window
+    m_left, m_top, m_right, m_bottom = monitor
+    return (
+        w_left <= m_left + tol
+        and w_top <= m_top + tol
+        and w_right >= m_right - tol
+        and w_bottom >= m_bottom - tol
+    )
+
+
+def foreground_fullscreen_monitor() -> QRect | None:
+    """Return the monitor rect covered by a fullscreen foreground window.
+
+    Returns None when the foreground window is not fullscreen. Compares the
+    window against the monitor's rcMonitor (the whole display), never rcWork,
+    so a merely *maximised* window - which covers rcWork but leaves the
+    taskbar visible - correctly does not count.
+    """
+    try:
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        if hwnd in (_user32.GetShellWindow(), _user32.GetDesktopWindow()):
+            return None
+
+        # Our own popups must never make us yield
+        pid = ctypes.wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == _OWN_PID:
+            return None
+
+        buf = ctypes.create_unicode_buffer(256)
+        _user32.GetClassNameW(hwnd, buf, 256)
+        if buf.value in _EXCLUDED_FULLSCREEN_CLASSES:
+            return None
+
+        rect = ctypes.wintypes.RECT()
+        if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+
+        hmon = _user32.MonitorFromWindow(hwnd, _MONITOR_DEFAULTTONEAREST)
+        if not hmon:
+            return None
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not _user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+            return None
+
+        mon = info.rcMonitor
+        if not covers_monitor(
+            (rect.left, rect.top, rect.right, rect.bottom),
+            (mon.left, mon.top, mon.right, mon.bottom),
+        ):
+            return None
+        return QRect(
+            mon.left, mon.top, mon.right - mon.left, mon.bottom - mon.top,
+        )
+    except Exception as exc:
+        log.debug("Fullscreen detection failed: %s", exc)
+        return None
+
+
+def shell_reports_fullscreen() -> bool:
+    """Secondary check for exclusive-mode D3D games and presentation mode.
+
+    The window-rect test can miss exclusive fullscreen, where the game does
+    not own a normal desktop-sized window. This cannot tell us *which*
+    monitor is involved, so callers should treat it as unconditional.
+    """
+    try:
+        state = ctypes.c_int()
+        if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) != 0:
+            return False
+        return state.value in (
+            _QUNS_RUNNING_D3D_FULL_SCREEN, _QUNS_PRESENTATION_MODE,
+        )
+    except Exception as exc:
+        log.debug("SHQueryUserNotificationState failed: %s", exc)
+        return False
 
 # ---------------------------------------------------------------------------
 # Theme definitions
@@ -1180,6 +1329,8 @@ class AudioFlipWidget(QWidget):
         self._bt_pending_device_name: str | None = None  # device name for name-based fallback
         self._bt_active_device_id: str | None = None  # device ID the dropdown is showing status for
         self._bt_retry_name: str | None = None  # kept for the 4s retry (not cleared by _set_pending)
+        self._fullscreen_yielding = False  # True while demoted for a fullscreen app
+        self._fullscreen_clear_ticks = 0
 
         # Build body container
         self._body = _BodyWidget(self)
@@ -1889,6 +2040,14 @@ class AudioFlipWidget(QWidget):
         aot_action.triggered.connect(self._toggle_always_on_top)
         menu.addAction(aot_action)
 
+        # Yield to fullscreen apps (only meaningful while always-on-top is on)
+        yield_action = QAction("Yield to fullscreen apps", self)
+        yield_action.setCheckable(True)
+        yield_action.setChecked(self._config_mgr.config.yield_to_fullscreen)
+        yield_action.setEnabled(self._config_mgr.config.always_on_top)
+        yield_action.triggered.connect(self._toggle_yield_to_fullscreen)
+        menu.addAction(yield_action)
+
         # Flash on change
         flash_action = QAction("Flash on change", self)
         flash_action.setCheckable(True)
@@ -2061,7 +2220,22 @@ class AudioFlipWidget(QWidget):
 
     def _toggle_always_on_top(self, checked: bool) -> None:
         self._config_mgr.set_always_on_top(checked)
+        self._clear_fullscreen_yield()
         self._apply_always_on_top(checked)
+
+    def _toggle_yield_to_fullscreen(self, checked: bool) -> None:
+        self._config_mgr.set_yield_to_fullscreen(checked)
+        if not checked:
+            # Turning it off while demoted must restore topmost immediately,
+            # rather than waiting for the fullscreen app to close.
+            self._clear_fullscreen_yield()
+            if self._config_mgr.config.always_on_top:
+                self._set_topmost(True)
+
+    def _clear_fullscreen_yield(self) -> None:
+        """Forget any in-progress yield so the next tick starts clean."""
+        self._fullscreen_yielding = False
+        self._fullscreen_clear_ticks = 0
 
     def _apply_always_on_top(self, on_top: bool) -> None:
         """Apply always-on-top using Win32 SetWindowPos for true taskbar-level topmost."""
@@ -2091,14 +2265,56 @@ class AudioFlipWidget(QWidget):
             if hasattr(self, "_topmost_timer"):
                 self._topmost_timer.stop()
 
+    def _should_yield_to_fullscreen(self) -> bool:
+        """Return True if a fullscreen app should take precedence over us."""
+        if not self._config_mgr.config.yield_to_fullscreen:
+            return False
+
+        monitor = foreground_fullscreen_monitor()
+        if monitor is not None:
+            # Only yield when the fullscreen app is on OUR monitor - fullscreen
+            # video on a second screen should not demote the widget.
+            return monitor.contains(self.frameGeometry().center())
+
+        # Exclusive-mode D3D games: no usable window rect, so no monitor to
+        # compare against. Yield unconditionally.
+        return shell_reports_fullscreen()
+
     def _reassert_topmost(self) -> None:
-        """Re-assert HWND_TOPMOST silently — no activate, no flash."""
+        """Re-assert HWND_TOPMOST silently — no activate, no flash.
+
+        Also drives the fullscreen yield: while a fullscreen app is active on
+        our monitor the widget drops to NOTOPMOST, and the timer keeps running
+        so we can detect the app exiting.
+        """
         if not self._config_mgr.config.always_on_top:
             return
-        hwnd = int(self.winId())
+
+        if self._should_yield_to_fullscreen():
+            self._fullscreen_clear_ticks = 0
+            if not self._fullscreen_yielding:
+                self._fullscreen_yielding = True
+                log.info("Fullscreen app detected - yielding always-on-top")
+                self._set_topmost(False)
+            return
+
+        if self._fullscreen_yielding:
+            # Require consecutive clear polls, otherwise alt-tabbing out of a
+            # game flickers the widget between z-orders.
+            self._fullscreen_clear_ticks += 1
+            if self._fullscreen_clear_ticks < _FULLSCREEN_CLEAR_TICKS:
+                return
+            self._fullscreen_yielding = False
+            self._fullscreen_clear_ticks = 0
+            log.info("Fullscreen app gone - restoring always-on-top")
+
+        self._set_topmost(True)
+
+    def _set_topmost(self, on_top: bool) -> None:
+        """Raw z-order change, without touching the re-assertion timer."""
         _user32.SetWindowPos(
-            hwnd,
-            _HWND_TOPMOST,
+            int(self.winId()),
+            _HWND_TOPMOST if on_top else _HWND_NOTOPMOST,
             0,
             0,
             0,
