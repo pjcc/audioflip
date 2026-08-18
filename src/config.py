@@ -7,11 +7,20 @@ from %APPDATA%/audioflip/config.json.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
+
+
+def _ps_quote(value: str) -> str:
+    """Quote a value for use as a PowerShell single-quoted literal."""
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def _appdata_dir() -> Path:
@@ -61,6 +70,7 @@ class ConfigManager:
     def __init__(self, config_path: Path | None = None) -> None:
         self._path = config_path or (_appdata_dir() / "config.json")
         self._config = self._load()
+        self._reconcile_startup_shortcut()
 
     @classmethod
     def instance(cls, config_path: Path | None = None) -> ConfigManager:
@@ -221,43 +231,87 @@ class ConfigManager:
         self.save()
 
     @staticmethod
-    def _update_startup_shortcut(enable: bool) -> None:
-        """Add or remove from Windows startup via the Start Menu Startup folder."""
+    def _startup_shortcut_path() -> Path:
+        """Return the path of the Start Menu Startup shortcut."""
+        base = Path(
+            os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")
+        )
+        return (
+            base / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+            / "Startup" / "audioflip.lnk"
+        )
+
+    @staticmethod
+    def _startup_target() -> tuple[str, str, str]:
+        """Return (target, arguments, working_dir) for the startup shortcut.
+
+        Running from source needs the interpreter plus the script path; the
+        old code pointed the shortcut at a bare python.exe with no arguments,
+        which launched an interpreter that did nothing. pythonw.exe is
+        preferred so no console window appears at login.
+        """
+        if getattr(sys, "frozen", False):
+            exe = Path(sys.executable)
+            return str(exe), "", str(exe.parent)
+
+        repo_root = Path(__file__).resolve().parent.parent
+        script = repo_root / "run.py"
+        interpreter = Path(sys.executable)
+        windowless = interpreter.with_name("pythonw.exe")
+        if not windowless.exists():
+            windowless = interpreter
+        return str(windowless), f'"{script}"', str(repo_root)
+
+    def _reconcile_startup_shortcut(self) -> None:
+        """Make the config agree with the Startup folder.
+
+        The shortcut is what actually makes Windows launch audioflip, so it
+        wins when the two disagree - which happens whenever config.json is
+        recreated, or the shortcut is added or removed by hand. Without this
+        the menu shows a checkbox that contradicts what the machine does.
+        """
+        actual = self._startup_shortcut_path().exists()
+        if actual != self._config.start_with_windows:
+            log.info(
+                "Startup shortcut %s but config said %s - trusting the shortcut",
+                "exists" if actual else "is absent",
+                self._config.start_with_windows,
+            )
+            self._config.start_with_windows = actual
+            self.save()
+
+    @classmethod
+    def _update_startup_shortcut(cls, enable: bool) -> None:
+        """Add or remove the Start Menu Startup shortcut."""
         try:
-            startup_dir = Path(
-                os.environ.get(
-                    "APPDATA",
-                    Path.home() / "AppData" / "Roaming",
-                )
-            ) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-            shortcut_path = startup_dir / "audioflip.lnk"
+            shortcut_path = cls._startup_shortcut_path()
 
             if not enable:
                 if shortcut_path.exists():
                     shortcut_path.unlink()
                 return
 
-            # Determine the executable path
-            if getattr(sys, "frozen", False):
-                target = sys.executable
-            else:
-                target = str(Path(sys.executable))
-                # When running from source, we'd need a different approach;
-                # for the packaged .exe this will be correct.
+            target, arguments, workdir = cls._startup_target()
+            shortcut_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Create shortcut using PowerShell
             ps_script = (
-                f'$ws = New-Object -ComObject WScript.Shell; '
-                f'$s = $ws.CreateShortcut("{shortcut_path}"); '
-                f'$s.TargetPath = "{target}"; '
-                f'$s.WorkingDirectory = "{Path(target).parent}"; '
-                f'$s.Save()'
+                "$ws = New-Object -ComObject WScript.Shell; "
+                f"$s = $ws.CreateShortcut({_ps_quote(str(shortcut_path))}); "
+                f"$s.TargetPath = {_ps_quote(target)}; "
+                f"$s.Arguments = {_ps_quote(arguments)}; "
+                f"$s.WorkingDirectory = {_ps_quote(workdir)}; "
+                "$s.Save()"
             )
-            import subprocess
-            subprocess.run(
-                ["powershell", "-Command", ps_script],
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
                 capture_output=True,
+                text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-        except Exception:
-            pass  # Non-critical; don't crash the app
+            if result.returncode != 0:
+                log.warning(
+                    "Failed to create startup shortcut: %s",
+                    (result.stderr or "").strip(),
+                )
+        except Exception as exc:
+            log.warning("Startup shortcut update failed: %s", exc)
