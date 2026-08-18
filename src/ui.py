@@ -1205,9 +1205,13 @@ class AudioFlipWidget(QWidget):
         # Apply theme
         self._apply_theme()
 
-        # Restore position and ensure it's on a visible screen
+        # Restore position and ensure it's on a visible screen.
+        # _desired_pos is the position the user chose; it is never overwritten
+        # by the off-screen rescue, so the widget can return to it when the
+        # monitor it belongs on comes back.
         pos = self._config_mgr.config.position
-        self.move(pos.get("x", 100), pos.get("y", 100))
+        self._desired_pos = QPoint(pos.get("x", 100), pos.get("y", 100))
+        self.move(self._desired_pos)
         self._ensure_on_screen()
 
         # Re-check position when a monitor is disconnected
@@ -1253,22 +1257,60 @@ class AudioFlipWidget(QWidget):
 
     # --- Screen / position guard -------------------------------------------
 
+    def _position_is_visible(self, pos: QPoint) -> bool:
+        """Return True if the widget would be on a visible screen at *pos*."""
+        centre = QPoint(pos.x() + self.width() // 2, pos.y() + self.height() // 2)
+        return any(
+            screen.availableGeometry().contains(centre)
+            for screen in QApplication.screens()
+        )
+
+    def _save_desired_position(self, x: int, y: int) -> None:
+        """Record a position the user deliberately chose, and persist it.
+
+        Only drag-release and 'Move to screen' should call this. The
+        off-screen rescue must not, or the saved position is lost the first
+        time the widget's monitor is absent (e.g. at boot, before Windows
+        has finished enumerating displays).
+        """
+        self._desired_pos = QPoint(x, y)
+        self._config_mgr.set_position(x, y)
+
     def _ensure_on_screen(self) -> None:
-        """If the widget centre is not within any visible screen, move it."""
-        centre = self.geometry().center()
-        for screen in QApplication.screens():
-            if screen.availableGeometry().contains(centre):
-                return  # visible — nothing to do
-        # Off-screen: move to centre of primary screen
+        """Keep the widget visible without ever discarding the desired position.
+
+        Prefers the user's desired position whenever it is visible, so the
+        widget returns home once a disconnected monitor comes back. When
+        nothing is visible it parks the widget on the primary screen, but
+        leaves the stored position untouched.
+        """
+        # Desired position usable - go (back) to it
+        if self._position_is_visible(self._desired_pos):
+            if self.pos() != self._desired_pos:
+                log.info(
+                    "Returning widget to desired position (%d, %d)",
+                    self._desired_pos.x(), self._desired_pos.y(),
+                )
+                self.move(self._desired_pos)
+            return
+
+        # Desired position unusable, but wherever we are now is visible - stay put
+        if self._position_is_visible(self.pos()):
+            return
+
+        # Nothing visible: park on the primary screen WITHOUT saving, so the
+        # desired position survives for when its monitor returns.
         primary = QApplication.primaryScreen()
         if primary is None:
             return
         geo = primary.availableGeometry()
         x = geo.x() + (geo.width() - self.width()) // 2
         y = geo.y() + (geo.height() - self.height()) // 2
-        log.info("Widget off-screen — relocating to (%d, %d)", x, y)
+        log.info(
+            "Widget off-screen - parking at (%d, %d); desired position (%d, %d) preserved",
+            x, y, self._desired_pos.x(), self._desired_pos.y(),
+        )
         self.move(x, y)
-        self._config_mgr.set_position(x, y)
 
     def _on_screen_removed(self, _screen: object) -> None:
         """Called when a monitor is disconnected."""
@@ -1284,7 +1326,7 @@ class AudioFlipWidget(QWidget):
         x = geo.x() + (geo.width() - self.width()) // 2
         y = geo.y() + (geo.height() - self.height()) // 2
         self.move(x, y)
-        self._config_mgr.set_position(x, y)
+        self._save_desired_position(x, y)
         self.show()
         self._apply_always_on_top(self._config_mgr.config.always_on_top)
 
@@ -1448,7 +1490,7 @@ class AudioFlipWidget(QWidget):
             if self._drag_offset is not None:
                 if not self._dragged:
                     self._open_dropdown()
-                self._config_mgr.set_position(self.x(), self.y())
+                self._save_desired_position(self.x(), self.y())
             self._reset_drag()
 
     def _open_dropdown(self) -> None:
