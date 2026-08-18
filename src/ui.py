@@ -123,6 +123,8 @@ _HWND_NOTOPMOST = ctypes.wintypes.HWND(-2)
 _MONITOR_DEFAULTTONEAREST = 0x0002
 _FULLSCREEN_TOLERANCE_PX = 2   # some apps miss the monitor rect by a pixel
 _FULLSCREEN_CLEAR_TICKS = 2    # consecutive clear polls before restoring topmost
+_GA_ROOT = 2                   # GetAncestor: top-level owner of a window
+_SURFACE_BURST_MS = 2000       # how long a tray-summoned widget stays above everything
 
 # Desktop and shell windows cover the whole monitor at all times and must
 # never count as a fullscreen app.
@@ -167,6 +169,11 @@ def _setup_fullscreen_prototypes() -> None:
         ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.DWORD),
     ]
     _user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+    # Used to tell 'behind another window' from 'hidden', which Qt cannot.
+    _user32.WindowFromPoint.argtypes = [ctypes.wintypes.POINT]
+    _user32.WindowFromPoint.restype = ctypes.wintypes.HWND
+    _user32.GetAncestor.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.UINT]
+    _user32.GetAncestor.restype = ctypes.wintypes.HWND
 
 
 _setup_fullscreen_prototypes()
@@ -1431,6 +1438,11 @@ class AudioFlipWidget(QWidget):
         self._poll_timer.timeout.connect(self._refresh_display)
         self._poll_timer.start(2000)
 
+        # Ends the temporary topmost burst after a tray summon
+        self._surface_timer = QTimer(self)
+        self._surface_timer.setSingleShot(True)
+        self._surface_timer.timeout.connect(self._end_surface_burst)
+
         # Topmost re-assertion timer (500ms)
         self._topmost_timer = QTimer(self)
         self._topmost_timer.timeout.connect(self._reassert_topmost)
@@ -2360,6 +2372,62 @@ class AudioFlipWidget(QWidget):
 
         self._set_topmost(True)
 
+    def is_obscured(self) -> bool:
+        """True when another window covers the widget's centre.
+
+        Qt cannot answer this: a widget buried under a maximised window is
+        still ``isVisible()``. ``WindowFromPoint`` returns the topmost window
+        at a point, so if its top-level owner is not us, we are behind
+        something. The point comes from ``GetWindowRect`` rather than
+        ``frameGeometry()`` so both sides are native pixels - Qt geometry is
+        logical, and would be wrong on a scaled display.
+        """
+        try:
+            own = int(self.winId())
+            rect = ctypes.wintypes.RECT()
+            if not _user32.GetWindowRect(own, ctypes.byref(rect)):
+                return False
+            point = ctypes.wintypes.POINT(
+                (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2,
+            )
+            hwnd = _user32.WindowFromPoint(point)
+            if not hwnd:
+                return True
+            return int(_user32.GetAncestor(hwnd, _GA_ROOT) or hwnd) != own
+        except Exception as exc:
+            log.debug("Obscured check failed: %s", exc)
+            return False
+
+    def surface(self) -> None:
+        """Show the widget and hold it above everything for a moment.
+
+        Raising within the normal band is not enough to make a lost widget
+        findable - anything topmost, such as another always-on-top utility,
+        would still cover it. So this goes fully topmost for
+        ``_SURFACE_BURST_MS`` and then drops back, which leaves the widget at
+        the *top* of the normal band rather than wherever it was buried.
+
+        With always-on-top already on there is nothing to time out, and a
+        fullscreen app on our monitor will re-yield on the next tick - that
+        is the setting doing its job, not this failing.
+        """
+        if not self.isVisible():
+            self.show()
+        self._set_topmost(True)
+        self._start_flash()
+        if self._config_mgr.config.always_on_top:
+            self._surface_timer.stop()
+            self._apply_always_on_top(True)
+            return
+        self._surface_timer.start(_SURFACE_BURST_MS)
+
+    def _end_surface_burst(self) -> None:
+        """Leave the topmost band again once the burst expires."""
+        if self._config_mgr.config.always_on_top:
+            # Turned on mid-burst - leave it topmost, that is now the setting.
+            return
+        self._set_topmost(False)
+
     def _set_topmost(self, on_top: bool) -> None:
         """Raw z-order change, without touching the re-assertion timer."""
         _user32.SetWindowPos(
@@ -2440,14 +2508,14 @@ class SystemTrayIcon(QSystemTrayIcon):
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            # Left-click: toggle widget visibility
-            if self._widget.isVisible():
+            # Left-click: hide only when the widget is genuinely in front.
+            # A buried widget is still visible to Qt, so a plain toggle hid
+            # something you could not see, and took a second click to bring
+            # back - which put it straight back behind the same window.
+            if self._widget.isVisible() and not self._widget.is_obscured():
                 self._widget.hide()
             else:
-                self._widget.show()
-                self._widget._apply_always_on_top(
-                    self._config_mgr.config.always_on_top
-                )
+                self._widget.surface()
         elif reason == QSystemTrayIcon.ActivationReason.Context:
             menu = self._widget.build_context_menu()
             menu.exec(QCursor.pos())
