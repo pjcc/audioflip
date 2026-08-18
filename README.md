@@ -51,6 +51,15 @@ python -m venv .venv
 .venv\Scripts\python.exe run.py
 ```
 
+## Tests
+
+```powershell
+.venv\Scripts\python.exe tests\test_fullscreen.py
+.venv\Scripts\python.exe tests\test_name_matching.py
+```
+
+Dependency-free — no pytest needed. They cover the pure logic where a wrong answer fails silently: fullscreen geometry (notably that a *maximised* window must not count as fullscreen), Bluetooth endpoint name matching, and icon keyword matching. Anything touching Win32, COM or Qt is verified by running the app.
+
 ## Building a Standalone .exe
 
 ```powershell
@@ -89,6 +98,7 @@ Stored in `%APPDATA%\audioflip\config.json`:
 - **Change notifications** — `IMMNotificationClient` callback + 2s polling fallback
 - **Always-on-top** — `SetWindowPos(HWND_TOPMOST)` re-asserted every 500ms
 - **Fullscreen detection** — foreground window rect compared against the monitor's `rcMonitor` (not `rcWork`, so maximised windows don't count), plus `SHQueryUserNotificationState` for exclusive-mode D3D games
-- **Bluetooth** — `BluetoothSetServiceState` via `ctypes` for A2DP/HFP toggling; `BluetoothAuthenticateDeviceEx` for new-device pairing via SSP (background `QThread`)
+- **Bluetooth** — `BluetoothSetServiceState` via `ctypes` for A2DP/HFP toggling; `BluetoothAuthenticateDeviceEx` for new-device pairing via SSP (background `QThread`). Falls back to `Enable-PnpDevice`/`Disable-PnpDevice` when the Win32 call fails — that fallback needs admin, and says so in the log when it doesn't have it
 - **BT reconciliation** — matches BT device name inside endpoint friendly name, auto-migrates favourites/icons to new endpoint ID
 - **Logging** — `RotatingFileHandler` to `%APPDATA%\audioflip\audioflip.log`
+- **Crash diagnostics** — `faulthandler` writes every thread's stack to `%APPDATA%\audioflip\crash.log`. The build has no console, so a native crash (an access violation inside a `ctypes` or COM call) otherwise kills the app silently, leaving a log that just stops mid-sentence
