@@ -21,9 +21,12 @@ Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 ```powershell
 # Tests (dependency-free, no pytest required)
 .venv\Scripts\python.exe tests\test_fullscreen.py
+.venv\Scripts\python.exe tests\test_name_matching.py
 ```
 
-There is no linter or formatter configured, and test coverage is limited to pure geometry helpers. Anything touching Win32, COM or Qt is verified manually: run the app and exercise the affected path.
+There is no linter or formatter configured, and test coverage is limited to pure functions - fullscreen geometry, Bluetooth endpoint name matching, icon keyword matching. Anything touching Win32, COM or Qt is verified manually: run the app and exercise the affected path.
+
+When a native crash happens the process dies silently, because the packaged build has no console. `faulthandler` writes the stack of every thread to `%APPDATA%\audioflip\crash.log` - check there first when the app vanishes and `audioflip.log` simply stops mid-sentence.
 
 Runtime state lives outside the repo:
 
@@ -44,7 +47,9 @@ Windows-only PyQt6 desktop widget for switching the default audio device and dri
 
 ### Device switching
 
-Uses the undocumented `IPolicyConfig` COM interface (CLSID `870af99c-171d-4f9e-af0d-e63df40c2bc9`), calling `SetDefaultEndpoint` for all three roles (Console, Multimedia, Communications). The `_fallback_set_default` PowerShell path calls `Set-AudioDevice`, which requires the third-party `AudioDeviceCmdlets` module - it is not a dependency, so treat that fallback as effectively unavailable.
+Uses the undocumented `IPolicyConfig` COM interface (CLSID `870af99c-171d-4f9e-af0d-e63df40c2bc9`), calling `SetDefaultEndpoint` for all three roles (Console, Multimedia, Communications). There is deliberately no fallback: the previous one shelled out to `Set-AudioDevice` from the third-party AudioDeviceCmdlets module, which is not a dependency and is not normally installed, so it spawned a process only to fail.
+
+`get_default_device()` asks Windows for the default endpoint directly rather than enumerating everything and filtering - the widget polls it every 2s, so the full enumeration was several times the necessary COM work. `_read_device_props()` is shared with `enumerate_devices()` so the Bluetooth detection rules stay in one place.
 
 Refresh is deliberately doubled up: an `IMMNotificationClient` COM callback plus a 2-second poll. The COM callback fires on a COM thread, so it must marshal to Qt via `QTimer.singleShot(0, ...)` - never touch widgets directly from it.
 
@@ -69,6 +74,13 @@ Refresh is deliberately doubled up: an `IMMNotificationClient` COM callback plus
 - Dropdown grow direction flips favourite ordering. When it grows upward, favourites render at the bottom so they stay nearest the cursor
 - Disconnected favourites are synthesised as `AudioDevice(is_connected=False)` ghost rows from cached config metadata, drawn at 40% icon opacity
 - Themes are plain dicts of seven colour keys in `_THEMES`. Adding one means updating both `_THEMES` and `VALID_THEMES` in `config.py`
+
+### The Bluetooth PowerShell fallback
+
+When `BluetoothSetServiceState` fails, `bluetooth.py` falls back to `Enable-PnpDevice`/`Disable-PnpDevice`. Two things to know:
+
+- it must be invoked with an argument list, never `shell=True`. The original built one command string routed through `cmd.exe`, which does not process backslash escapes, so `-Confirm:$false` arrived mangled and PowerShell rejected it as a string where a switch was required. The fallback therefore failed on argument binding every time, for months, while looking like it was trying
+- `Enable-PnpDevice` requires elevation, so this path still fails when audioflip runs unelevated - it now says so explicitly rather than failing obscurely
 
 ### Position and screen handling
 
