@@ -420,6 +420,10 @@ def _menu_stylesheet(t: dict[str, str]) -> str:
         f"border: 1px solid {t['border']}; border-radius: 6px; padding: 4px; }}"
         f"QMenu::item {{ padding: 6px 20px; border-radius: 4px; }}"
         f"QMenu::item:selected {{ background-color: {t['bg_hover']}; }}"
+        # Setting an explicit colour on QMenu overrides Qt's automatic greying,
+        # so disabled items need their own rule or they look enabled.
+        f"QMenu::item:disabled {{ color: {t['fg_dim']}; }}"
+        f"QMenu::item:disabled:selected {{ background-color: transparent; }}"
         f"QMenu::separator {{ background-color: {t['border']}; height: 1px; margin: 4px 8px; }}"
     )
 
@@ -2040,11 +2044,15 @@ class AudioFlipWidget(QWidget):
         aot_action.triggered.connect(self._toggle_always_on_top)
         menu.addAction(aot_action)
 
-        # Yield to fullscreen apps (only meaningful while always-on-top is on)
+        # Yield to fullscreen apps (only meaningful while always-on-top is on).
+        # When always-on-top is off this does nothing, so it shows unticked as
+        # well as greyed. The stored preference is left alone, so re-enabling
+        # always-on-top brings the user's choice back.
+        aot_on = self._config_mgr.config.always_on_top
         yield_action = QAction("Yield to fullscreen apps", self)
         yield_action.setCheckable(True)
-        yield_action.setChecked(self._config_mgr.config.yield_to_fullscreen)
-        yield_action.setEnabled(self._config_mgr.config.always_on_top)
+        yield_action.setChecked(self._config_mgr.config.yield_to_fullscreen and aot_on)
+        yield_action.setEnabled(aot_on)
         yield_action.triggered.connect(self._toggle_yield_to_fullscreen)
         menu.addAction(yield_action)
 
