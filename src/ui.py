@@ -384,6 +384,21 @@ def _rounded_mask(width: int, height: int, radius: int) -> QBitmap:
     return bmp
 
 
+def _screen_area_at(point: QPoint) -> QRect:
+    """Return the available geometry of the screen containing *point*.
+
+    Popups must be laid out against the screen they will actually appear on.
+    Using the primary screen's geometry sends the grow-up/grow-down decision
+    and the horizontal clamp against the wrong rectangle whenever the widget
+    lives on a secondary monitor.
+
+    availableGeometry (not geometry) is right here: unlike the widget itself,
+    popups should not open underneath the taskbar.
+    """
+    screen = QApplication.screenAt(point) or QApplication.primaryScreen()
+    return screen.availableGeometry() if screen is not None else QRect()
+
+
 def _t(config_mgr: ConfigManager) -> dict[str, str]:
     """Return the active theme palette dict."""
     return _THEMES.get(config_mgr.config.theme, _THEMES["dark"])
@@ -725,7 +740,7 @@ class DeviceDropdown(QWidget):
         if show_mode in ("input", "both"):
             row_count += len(inputs) + 1
         est_height = min(row_count * 38 + 50, 420)
-        screen_geo = QApplication.primaryScreen().availableGeometry()
+        screen_geo = _screen_area_at(anchor)
         if reposition:
             grows_up = (anchor.y() + est_height) > screen_geo.bottom()
             # When grows_up: favourites at bottom (closer to widget) = closer to cursor
@@ -1570,11 +1585,17 @@ class AudioFlipWidget(QWidget):
         QTimer.singleShot(0, self._ensure_on_screen)
 
     def _move_to_screen(self) -> None:
-        """Move the widget to the centre of the current primary screen."""
-        primary = QApplication.primaryScreen()
-        if primary is None:
+        """Move the widget to the centre of the screen under the cursor.
+
+        The README calls this 'reposition widget to the active monitor', but
+        it used to centre on the primary screen regardless. Going by the
+        cursor makes it do what it says, and makes it useful from the tray
+        menu: the widget lands on the monitor you invoked it from.
+        """
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        if screen is None:
             return
-        geo = primary.availableGeometry()
+        geo = screen.availableGeometry()
         x = geo.x() + (geo.width() - self.width()) // 2
         y = geo.y() + (geo.height() - self.height()) // 2
         self.move(x, y)
@@ -1596,7 +1617,7 @@ class AudioFlipWidget(QWidget):
         dialog.pair_succeeded.connect(self._on_bt_scan_pair_succeeded)
 
         # Position: same logic as dropdown / context menu
-        screen_geo = QApplication.primaryScreen().availableGeometry()
+        screen_geo = _screen_area_at(self.frameGeometry().center())
         dlg_size = dialog.sizeHint()
         anchor_below = self.mapToGlobal(QPoint(0, self.height() + 4))
         anchor_above = self.mapToGlobal(QPoint(0, -dlg_size.height() - 4))
@@ -2181,7 +2202,7 @@ class AudioFlipWidget(QWidget):
                 submenu.installEventFilter(self)
 
         # Position above or below the widget, like the dropdown
-        screen_geo = QApplication.primaryScreen().availableGeometry()
+        screen_geo = _screen_area_at(self.frameGeometry().center())
         menu_size = self._ctx_menu.sizeHint()
         anchor_below = self.mapToGlobal(QPoint(0, self.height() + 4))
         anchor_above = self.mapToGlobal(QPoint(0, -menu_size.height() - 4))
