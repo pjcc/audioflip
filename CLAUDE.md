@@ -20,7 +20,7 @@ Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 
 ```powershell
 # Tests (dependency-free, no pytest required)
-.venv\Scripts\python.exe tests	est_fullscreen.py
+.venv\Scripts\python.exe tests\test_fullscreen.py
 ```
 
 There is no linter or formatter configured, and test coverage is limited to pure geometry helpers. Anything touching Win32, COM or Qt is verified manually: run the app and exercise the affected path.
