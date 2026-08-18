@@ -53,6 +53,9 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
 
 FALLBACK_ICON = "audio"
 
+# Everything get_icon will render: the device icons plus the menu checkmark.
+_RENDERABLE_KEYS = frozenset(ICON_TYPES) | {"checkmark"}
+
 
 def _resources_dir() -> Path:
     """Return path to the resources/ directory, handling frozen builds."""
@@ -98,6 +101,13 @@ class IconManager:
         Returns:
             A tinted QIcon ready for display.
         """
+        # icon_key can originate from icon_overrides in config.json, and it is
+        # joined into a path below, so a value like '../../foo' would read an
+        # SVG from outside resources/. Validate at the sink, which covers every
+        # caller regardless of where the key came from.
+        if icon_key not in _RENDERABLE_KEYS:
+            icon_key = FALLBACK_ICON
+
         cache_key = (icon_key, size)
         if cache_key in self._cache:
             return self._cache[cache_key]
