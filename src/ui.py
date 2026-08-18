@@ -865,14 +865,14 @@ class DeviceDropdown(QWidget):
         # BT connect: disconnected BT favourite → keep dropdown open
         if not device.is_connected and device.is_bluetooth:
             self._bt_busy = True
-            self._set_row_status(device.id, "Connecting\u2026")
+            self.set_row_status(device.id, "Connecting\u2026")
             self.bt_connect_requested.emit(device)
             return
 
         # BT disconnect: only when it's already the active (default) device
         if device.is_bluetooth and device.is_connected and device.is_default:
             self._bt_busy = True
-            self._set_row_status(device.id, "Disconnecting\u2026")
+            self.set_row_status(device.id, "Disconnecting\u2026")
             self.bt_disconnect_requested.emit(device)
             return
 
@@ -880,8 +880,12 @@ class DeviceDropdown(QWidget):
         self.device_selected.emit(device)
         self._fade_out_and_close()
 
-    def _set_row_status(self, device_id: str, text: str) -> None:
-        """Update the name label on a device row (e.g. 'Connecting…')."""
+    def set_row_status(self, device_id: str, text: str) -> None:
+        """Update the name label on a device row (e.g. 'Connecting…').
+
+        Public because AudioFlipWidget drives it while a Bluetooth
+        operation runs on a background thread.
+        """
         row = self._rows_by_device_id.get(device_id)
         if row:
             row.set_name_text(text)
@@ -894,13 +898,17 @@ class DeviceDropdown(QWidget):
         """
         self._bt_busy = False
         if success:
-            self._repopulate()
+            self.repopulate()
         else:
             label = "Connection failed" if action == "connect" else "Disconnect failed"
-            self._set_row_status(device_id, label)
+            self.set_row_status(device_id, label)
 
-    def _repopulate(self) -> None:
-        """Re-populate the dropdown in-place with fresh device data."""
+    def repopulate(self) -> None:
+        """Re-populate the dropdown in-place with fresh device data.
+
+        Public because AudioFlipWidget refreshes the open dropdown after a
+        favourite toggle or a Bluetooth state change.
+        """
         self.populate_and_show(
             self.pos(),
             self._last_show_mode,
@@ -984,6 +992,11 @@ class _BodyWidget(QWidget):
     @property
     def volume_active(self) -> bool:
         return self._vol_opacity > 0.01
+
+    @property
+    def volume_level(self) -> float:
+        """Last level shown, used to avoid API rounding jitter while scrolling."""
+        return self._vol_level
 
     def _vol_start_fade(self) -> None:
         self._vol_fade_timer.start()
@@ -1871,7 +1884,7 @@ class AudioFlipWidget(QWidget):
         # Update dropdown row status
         if self._dropdown and self._dropdown.isVisible():
             if action == "connect" and success:
-                self._dropdown._set_row_status(device_id or "", "Connected \u2014 switching\u2026")
+                self._dropdown.set_row_status(device_id or "", "Connected \u2014 switching\u2026")
             elif not success:
                 # Show failure on dropdown, it will auto-close after 2s
                 self._dropdown.show_bt_result(device_id or "", False, action)
@@ -1946,7 +1959,7 @@ class AudioFlipWidget(QWidget):
                 # Don't show failure — the 4s retry may still succeed
                 log.info("1.5s switch attempt inconclusive for '%s', 4s retry pending", dev_name)
                 if self._dropdown and self._dropdown.isVisible():
-                    self._dropdown._set_row_status(dropdown_device_id or "", "Switching\u2026")
+                    self._dropdown.set_row_status(dropdown_device_id or "", "Switching\u2026")
 
         self._refresh_display()
 
@@ -1987,7 +2000,7 @@ class AudioFlipWidget(QWidget):
 
         self._refresh_display()
         if self._dropdown and self._dropdown.isVisible():
-            self._dropdown._repopulate()
+            self._dropdown.repopulate()
 
     def _find_bt_device_by_name(self, name: str) -> AudioDevice | None:
         """Find an active BT audio device whose name matches the given name."""
@@ -2019,7 +2032,7 @@ class AudioFlipWidget(QWidget):
         )
         # Repopulate in-place — avoids close/reopen flicker and click-through
         if hasattr(self, "_dropdown") and self._dropdown.isVisible():
-            self._dropdown._repopulate()
+            self._dropdown.repopulate()
 
     def _on_dropdown_closed(self) -> None:
         """Record when the dropdown closes so we can suppress immediate reopen."""
@@ -2038,7 +2051,7 @@ class AudioFlipWidget(QWidget):
 
         # Use cached level if overlay is active to avoid API rounding jitter
         if self._body.volume_active:
-            current = self._body._vol_level
+            current = self._body.volume_level
         else:
             current = self._audio_mgr.get_default_volume(flow)
             if current is None:
