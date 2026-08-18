@@ -6,6 +6,8 @@ starts the PyQt6 event loop.
 
 from __future__ import annotations
 
+import datetime
+import faulthandler
 import os
 import sys
 import logging
@@ -41,12 +43,42 @@ def _setup_logging() -> None:
     logging.getLogger().addHandler(file_handler)
 
 
+_crash_file = None  # module-level so the handle outlives _setup_crash_handler
+
+
+def _setup_crash_handler() -> None:
+    """Write a Python traceback to disk if the process dies in native code.
+
+    The packaged build runs with console=False, so stderr goes nowhere. A
+    native crash - an access violation inside a ctypes or COM call, say -
+    then kills the process silently, leaving only a log that stops
+    mid-sentence. faulthandler dumps the stack of every thread instead,
+    which is the difference between a diagnosable crash and a mystery.
+    """
+    global _crash_file
+    try:
+        log_dir = os.path.join(os.environ.get("APPDATA", "."), "audioflip")
+        os.makedirs(log_dir, exist_ok=True)
+        _crash_file = open(
+            os.path.join(log_dir, "crash.log"), "a", buffering=1, encoding="utf-8",
+        )
+        _crash_file.write(
+            "\n===== session started "
+            + datetime.datetime.now().isoformat(timespec="seconds")
+            + " =====\n"
+        )
+        faulthandler.enable(file=_crash_file, all_threads=True)
+    except Exception:
+        pass  # diagnostics must never stop the app starting
+
+
 log = logging.getLogger(__name__)
 
 
 def main() -> int:
     """Launch the audioflip widget."""
     _setup_logging()
+    _setup_crash_handler()
     log.info("audioflip starting")
 
     app = QApplication(sys.argv)
