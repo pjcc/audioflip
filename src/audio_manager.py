@@ -284,27 +284,11 @@ class AudioManager:
                 policy.SetDefaultEndpoint(device_id, role)
             return True
         except Exception as exc:
+            # There is deliberately no fallback here. The previous one shelled
+            # out to Set-AudioDevice from the third-party AudioDeviceCmdlets
+            # module, which is not a dependency and is not installed by
+            # default, so it spawned a PowerShell process only to fail.
             log.error("Failed to set default device %s: %s", device_id, exc)
-            return self._fallback_set_default(device_id)
-
-    def _fallback_set_default(self, device_id: str) -> bool:
-        """Fallback: use AudioDeviceCmdlets via PowerShell."""
-        import subprocess
-        try:
-            result = subprocess.run(
-                [
-                    "powershell",
-                    "-Command",
-                    f'Set-AudioDevice -ID "{device_id}"',
-                ],
-                capture_output=True,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                timeout=5,
-            )
-            return result.returncode == 0
-        except Exception as exc:
-            log.error("Fallback device switch failed: %s", exc)
             return False
 
     def register_change_callback(self, on_change: Callable[[], None]) -> None:

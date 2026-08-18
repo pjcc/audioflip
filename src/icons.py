@@ -40,6 +40,8 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
     (["earbud", "in-ear", "inear"], "earbuds"),
     (["bluetooth", "airpods", "buds", "galaxy buds"], "bluetooth"),
     (["monitor", "hdmi", "displayport", "display"], "monitor"),
+    # After the display entry, so an HDMI-connected TV still reads as a monitor
+    (["tv", "television"], "tv"),
     (["webcam", "camera"], "camera"),
     (["soundbar"], "soundbar"),
     (["dac", "audio interface", "interface"], "mixer"),

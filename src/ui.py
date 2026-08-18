@@ -384,6 +384,21 @@ def _rounded_mask(width: int, height: int, radius: int) -> QBitmap:
     return bmp
 
 
+def _screen_area_at(point: QPoint) -> QRect:
+    """Return the available geometry of the screen containing *point*.
+
+    Popups must be laid out against the screen they will actually appear on.
+    Using the primary screen's geometry sends the grow-up/grow-down decision
+    and the horizontal clamp against the wrong rectangle whenever the widget
+    lives on a secondary monitor.
+
+    availableGeometry (not geometry) is right here: unlike the widget itself,
+    popups should not open underneath the taskbar.
+    """
+    screen = QApplication.screenAt(point) or QApplication.primaryScreen()
+    return screen.availableGeometry() if screen is not None else QRect()
+
+
 def _t(config_mgr: ConfigManager) -> dict[str, str]:
     """Return the active theme palette dict."""
     return _THEMES.get(config_mgr.config.theme, _THEMES["dark"])
@@ -725,7 +740,7 @@ class DeviceDropdown(QWidget):
         if show_mode in ("input", "both"):
             row_count += len(inputs) + 1
         est_height = min(row_count * 38 + 50, 420)
-        screen_geo = QApplication.primaryScreen().availableGeometry()
+        screen_geo = _screen_area_at(anchor)
         if reposition:
             grows_up = (anchor.y() + est_height) > screen_geo.bottom()
             # When grows_up: favourites at bottom (closer to widget) = closer to cursor
@@ -850,14 +865,14 @@ class DeviceDropdown(QWidget):
         # BT connect: disconnected BT favourite → keep dropdown open
         if not device.is_connected and device.is_bluetooth:
             self._bt_busy = True
-            self._set_row_status(device.id, "Connecting\u2026")
+            self.set_row_status(device.id, "Connecting\u2026")
             self.bt_connect_requested.emit(device)
             return
 
         # BT disconnect: only when it's already the active (default) device
         if device.is_bluetooth and device.is_connected and device.is_default:
             self._bt_busy = True
-            self._set_row_status(device.id, "Disconnecting\u2026")
+            self.set_row_status(device.id, "Disconnecting\u2026")
             self.bt_disconnect_requested.emit(device)
             return
 
@@ -865,8 +880,12 @@ class DeviceDropdown(QWidget):
         self.device_selected.emit(device)
         self._fade_out_and_close()
 
-    def _set_row_status(self, device_id: str, text: str) -> None:
-        """Update the name label on a device row (e.g. 'Connecting…')."""
+    def set_row_status(self, device_id: str, text: str) -> None:
+        """Update the name label on a device row (e.g. 'Connecting…').
+
+        Public because AudioFlipWidget drives it while a Bluetooth
+        operation runs on a background thread.
+        """
         row = self._rows_by_device_id.get(device_id)
         if row:
             row.set_name_text(text)
@@ -879,13 +898,17 @@ class DeviceDropdown(QWidget):
         """
         self._bt_busy = False
         if success:
-            self._repopulate()
+            self.repopulate()
         else:
             label = "Connection failed" if action == "connect" else "Disconnect failed"
-            self._set_row_status(device_id, label)
+            self.set_row_status(device_id, label)
 
-    def _repopulate(self) -> None:
-        """Re-populate the dropdown in-place with fresh device data."""
+    def repopulate(self) -> None:
+        """Re-populate the dropdown in-place with fresh device data.
+
+        Public because AudioFlipWidget refreshes the open dropdown after a
+        favourite toggle or a Bluetooth state change.
+        """
         self.populate_and_show(
             self.pos(),
             self._last_show_mode,
@@ -969,6 +992,11 @@ class _BodyWidget(QWidget):
     @property
     def volume_active(self) -> bool:
         return self._vol_opacity > 0.01
+
+    @property
+    def volume_level(self) -> float:
+        """Last level shown, used to avoid API rounding jitter while scrolling."""
+        return self._vol_level
 
     def _vol_start_fade(self) -> None:
         self._vol_fade_timer.start()
@@ -1570,11 +1598,17 @@ class AudioFlipWidget(QWidget):
         QTimer.singleShot(0, self._ensure_on_screen)
 
     def _move_to_screen(self) -> None:
-        """Move the widget to the centre of the current primary screen."""
-        primary = QApplication.primaryScreen()
-        if primary is None:
+        """Move the widget to the centre of the screen under the cursor.
+
+        The README calls this 'reposition widget to the active monitor', but
+        it used to centre on the primary screen regardless. Going by the
+        cursor makes it do what it says, and makes it useful from the tray
+        menu: the widget lands on the monitor you invoked it from.
+        """
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        if screen is None:
             return
-        geo = primary.availableGeometry()
+        geo = screen.availableGeometry()
         x = geo.x() + (geo.width() - self.width()) // 2
         y = geo.y() + (geo.height() - self.height()) // 2
         self.move(x, y)
@@ -1596,7 +1630,7 @@ class AudioFlipWidget(QWidget):
         dialog.pair_succeeded.connect(self._on_bt_scan_pair_succeeded)
 
         # Position: same logic as dropdown / context menu
-        screen_geo = QApplication.primaryScreen().availableGeometry()
+        screen_geo = _screen_area_at(self.frameGeometry().center())
         dlg_size = dialog.sizeHint()
         anchor_below = self.mapToGlobal(QPoint(0, self.height() + 4))
         anchor_above = self.mapToGlobal(QPoint(0, -dlg_size.height() - 4))
@@ -1850,7 +1884,7 @@ class AudioFlipWidget(QWidget):
         # Update dropdown row status
         if self._dropdown and self._dropdown.isVisible():
             if action == "connect" and success:
-                self._dropdown._set_row_status(device_id or "", "Connected \u2014 switching\u2026")
+                self._dropdown.set_row_status(device_id or "", "Connected \u2014 switching\u2026")
             elif not success:
                 # Show failure on dropdown, it will auto-close after 2s
                 self._dropdown.show_bt_result(device_id or "", False, action)
@@ -1925,7 +1959,7 @@ class AudioFlipWidget(QWidget):
                 # Don't show failure — the 4s retry may still succeed
                 log.info("1.5s switch attempt inconclusive for '%s', 4s retry pending", dev_name)
                 if self._dropdown and self._dropdown.isVisible():
-                    self._dropdown._set_row_status(dropdown_device_id or "", "Switching\u2026")
+                    self._dropdown.set_row_status(dropdown_device_id or "", "Switching\u2026")
 
         self._refresh_display()
 
@@ -1966,7 +2000,7 @@ class AudioFlipWidget(QWidget):
 
         self._refresh_display()
         if self._dropdown and self._dropdown.isVisible():
-            self._dropdown._repopulate()
+            self._dropdown.repopulate()
 
     def _find_bt_device_by_name(self, name: str) -> AudioDevice | None:
         """Find an active BT audio device whose name matches the given name."""
@@ -1998,7 +2032,7 @@ class AudioFlipWidget(QWidget):
         )
         # Repopulate in-place — avoids close/reopen flicker and click-through
         if hasattr(self, "_dropdown") and self._dropdown.isVisible():
-            self._dropdown._repopulate()
+            self._dropdown.repopulate()
 
     def _on_dropdown_closed(self) -> None:
         """Record when the dropdown closes so we can suppress immediate reopen."""
@@ -2017,7 +2051,7 @@ class AudioFlipWidget(QWidget):
 
         # Use cached level if overlay is active to avoid API rounding jitter
         if self._body.volume_active:
-            current = self._body._vol_level
+            current = self._body.volume_level
         else:
             current = self._audio_mgr.get_default_volume(flow)
             if current is None:
@@ -2181,7 +2215,7 @@ class AudioFlipWidget(QWidget):
                 submenu.installEventFilter(self)
 
         # Position above or below the widget, like the dropdown
-        screen_geo = QApplication.primaryScreen().availableGeometry()
+        screen_geo = _screen_area_at(self.frameGeometry().center())
         menu_size = self._ctx_menu.sizeHint()
         anchor_below = self.mapToGlobal(QPoint(0, self.height() + 4))
         anchor_above = self.mapToGlobal(QPoint(0, -menu_size.height() - 4))
