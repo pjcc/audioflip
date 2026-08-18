@@ -21,11 +21,12 @@ Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 ```powershell
 # Tests (dependency-free, no pytest required)
 .venv\Scripts\python.exe tests\test_fullscreen.py
+.venv\Scripts\python.exe tests\test_name_matching.py
 ```
 
 There is no linter or formatter configured, and test coverage is limited to pure functions - fullscreen geometry, Bluetooth endpoint name matching, icon keyword matching. Anything touching Win32, COM or Qt is verified manually: run the app and exercise the affected path.
 
-When a native crash happens the process dies silently, because the packaged build has no console. `faulthandler` writes the stack of every thread to `%APPDATA%udioflip\crash.log` - check there first when the app vanishes and `audioflip.log` simply stops mid-sentence.
+When a native crash happens the process dies silently, because the packaged build has no console. `faulthandler` writes the stack of every thread to `%APPDATA%\audioflip\crash.log` - check there first when the app vanishes and `audioflip.log` simply stops mid-sentence.
 
 Runtime state lives outside the repo:
 
