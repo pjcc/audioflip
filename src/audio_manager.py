@@ -14,11 +14,10 @@ from typing import Callable
 
 import comtypes
 from comtypes import GUID, HRESULT, COMMETHOD
-from ctypes import POINTER, c_uint, c_wchar_p, cast
-from ctypes.wintypes import LPCWSTR, DWORD, BOOL
+from ctypes import POINTER, c_uint, cast
+from ctypes.wintypes import LPCWSTR, BOOL
 
 from pycaw.pycaw import (
-    AudioUtilities,
     IAudioEndpointVolume,
     IMMDeviceEnumerator,
     IMMDevice,
@@ -29,6 +28,10 @@ from pycaw.pycaw import (
 )
 
 log = logging.getLogger(__name__)
+
+_PKEY_FMTID = "{a45c254e-df1c-4efd-8020-67d146a850e0}"
+_PKEY_DEVICE_FRIENDLY_NAME = 14
+_PKEY_DEVICE_ENUMERATOR_NAME = 24
 
 _CLSCTX_ALL = 0x17  # CLSCTX_INPROC_SERVER | INPROC_HANDLER | LOCAL_SERVER | REMOTE_SERVER
 
@@ -164,6 +167,88 @@ class AudioManager:
             )
         return self._policy_config
 
+    @staticmethod
+    def _get_prop(props: object, pid: int) -> str:
+        """Read one string property from an already-open property store."""
+        from comtypes import GUID as G
+        from pycaw.pycaw import PROPERTYKEY
+        pk = PROPERTYKEY()
+        pk.fmtid = G(_PKEY_FMTID)
+        pk.pid = pid
+        return props.GetValue(pk).GetValue() or ""
+
+    def _read_device_props(self, dev: IMMDevice, fallback: str = "Unknown") -> tuple[str, bool]:
+        """Return (friendly_name, is_bluetooth) for one endpoint.
+
+        Shared by enumerate_devices() and get_default_device() so the
+        Bluetooth detection rules stay in one place.
+        """
+        props = dev.OpenPropertyStore(0)  # STGM_READ
+
+        try:
+            name = self._get_prop(props, _PKEY_DEVICE_FRIENDLY_NAME) or fallback
+        except Exception:
+            name = fallback
+
+        # Primary signal: PKEY_Device_EnumeratorName. Some stacks report
+        # BTHENUM, others BTHHFENUM, hence the prefix test.
+        enumerator_name = ""
+        is_bt = False
+        try:
+            enumerator_name = self._get_prop(props, _PKEY_DEVICE_ENUMERATOR_NAME).upper()
+            is_bt = enumerator_name.startswith("BTH")
+        except Exception as exc:
+            log.debug("Enumerator detection failed for '%s': %s", name, exc)
+
+        # Fallback: cross-reference against paired BT device names. Intel/Dell
+        # audio controllers proxy BT audio through their own driver, reporting
+        # enumerator='INTELAUDIO' instead of a BTH* prefix. The paired-name
+        # list is cached for 30s, so this stays cheap under polling.
+        if not is_bt:
+            try:
+                from .bluetooth import get_paired_device_names
+                name_lower = name.lower()
+                for bt_name in get_paired_device_names():
+                    bt_lower = bt_name.lower()
+                    if bt_lower in name_lower or name_lower in bt_lower:
+                        is_bt = True
+                        log.info(
+                            "Device '%s' matched paired BT device '%s' "
+                            "(name cross-ref, enumerator='%s')",
+                            name, bt_name, enumerator_name,
+                        )
+                        break
+            except Exception as exc:
+                log.debug("BT name cross-ref failed for '%s': %s", name, exc)
+
+        log.debug("Device '%s' enumerator='%s' is_bt=%s", name, enumerator_name, is_bt)
+        return name, is_bt
+
+    def get_default_device(self, flow: DeviceFlow = DeviceFlow.OUTPUT) -> AudioDevice | None:
+        """Return the current default endpoint for *flow*, or None.
+
+        Asks Windows for the default endpoint directly instead of enumerating
+        every device and filtering. The widget polls this every 2s, where the
+        full enumeration was doing several times the necessary COM work.
+        """
+        try:
+            edata = (
+                EDataFlow.eRender.value
+                if flow == DeviceFlow.OUTPUT
+                else EDataFlow.eCapture.value
+            )
+            dev = self._enumerator.GetDefaultAudioEndpoint(
+                edata, ERole.eMultimedia.value
+            )
+            name, is_bt = self._read_device_props(dev)
+            return AudioDevice(
+                id=dev.GetId(), name=name, flow=flow,
+                is_default=True, is_bluetooth=is_bt,
+            )
+        except Exception as exc:
+            log.debug("No default %s device: %s", flow.value, exc)
+            return None
+
     def enumerate_devices(self) -> list[AudioDevice]:
         """Return all active audio input and output devices.
 
@@ -189,58 +274,7 @@ class AudioManager:
                 for i in range(count):
                     dev: IMMDevice = collection.Item(i)
                     dev_id = dev.GetId()
-                    props = dev.OpenPropertyStore(0)  # STGM_READ
-                    try:
-                        # PKEY_Device_FriendlyName = {a45c254e-df1c-4efd-8020-67d146a850e0}, 14
-                        from comtypes import GUID as G
-                        from pycaw.pycaw import PROPERTYKEY
-                        pk = PROPERTYKEY()
-                        pk.fmtid = G("{a45c254e-df1c-4efd-8020-67d146a850e0}")
-                        pk.pid = 14
-                        pv = props.GetValue(pk)
-                        name = pv.GetValue() or f"Device {i}"
-                    except Exception:
-                        name = f"Device {i}"
-
-                    # Detect Bluetooth via PKEY_Device_EnumeratorName (pid 24)
-                    is_bt = False
-                    enumerator_name = ""
-                    try:
-                        from comtypes import GUID as G
-                        from pycaw.pycaw import PROPERTYKEY
-                        pk_enum = PROPERTYKEY()
-                        pk_enum.fmtid = G("{a45c254e-df1c-4efd-8020-67d146a850e0}")
-                        pk_enum.pid = 24
-                        pv_enum = props.GetValue(pk_enum)
-                        enumerator_name = (pv_enum.GetValue() or "").upper()
-                        # Some stacks use BTHENUM, others BTHHFENUM, etc.
-                        is_bt = enumerator_name.startswith("BTH")
-                    except Exception as exc:
-                        log.debug("Enumerator detection failed for '%s': %s", name, exc)
-
-                    # Fallback: cross-reference against paired BT device names.
-                    # Intel/Dell audio controllers proxy BT audio through their
-                    # own driver, reporting enumerator='INTELAUDIO' instead of
-                    # a BTH* prefix.  Match the audio endpoint name against the
-                    # BT stack's paired device list (cached, refreshed every 30s).
-                    if not is_bt:
-                        try:
-                            from .bluetooth import get_paired_device_names
-                            name_lower = name.lower()
-                            for bt_name in get_paired_device_names():
-                                bt_lower = bt_name.lower()
-                                if bt_lower in name_lower or name_lower in bt_lower:
-                                    is_bt = True
-                                    log.info(
-                                        "Device '%s' matched paired BT device '%s' "
-                                        "(name cross-ref, enumerator='%s')",
-                                        name, bt_name, enumerator_name,
-                                    )
-                                    break
-                        except Exception as exc:
-                            log.debug("BT name cross-ref failed for '%s': %s", name, exc)
-
-                    log.debug("Device '%s' enumerator='%s' is_bt=%s", name, enumerator_name, is_bt)
+                    name, is_bt = self._read_device_props(dev, fallback=f"Device {i}")
 
                     default_id = (
                         default_output_id
@@ -321,17 +355,11 @@ class AudioManager:
 
     def get_default_output(self) -> AudioDevice | None:
         """Return the current default output device, or None."""
-        for d in self.enumerate_devices():
-            if d.flow == DeviceFlow.OUTPUT and d.is_default:
-                return d
-        return None
+        return self.get_default_device(DeviceFlow.OUTPUT)
 
     def get_default_input(self) -> AudioDevice | None:
         """Return the current default input device, or None."""
-        for d in self.enumerate_devices():
-            if d.flow == DeviceFlow.INPUT and d.is_default:
-                return d
-        return None
+        return self.get_default_device(DeviceFlow.INPUT)
 
     def get_default_volume(self, flow: DeviceFlow = DeviceFlow.OUTPUT) -> float | None:
         """Get master volume scalar (0.0-1.0) of the default device."""
