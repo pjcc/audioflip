@@ -250,7 +250,7 @@ def describe_window(hwnd: int | None) -> str:
     would still leave us above it.
     """
     if not hwnd:
-        return "no window (exclusive fullscreen)"
+        return "no window"
     try:
         buf = ctypes.create_unicode_buffer(256)
         _user32.GetClassNameW(hwnd, buf, 256)
@@ -2467,12 +2467,12 @@ class AudioFlipWidget(QWidget):
             0,
             _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE,
         )
-    def is_obscured(self) -> bool:
-        """True when another window covers the widget's centre.
+    def window_over_centre(self) -> int:
+        """Top-level window covering the widget's centre, or 0 if unknown.
 
         Qt cannot answer this: a widget buried under a maximised window is
         still ``isVisible()``. ``WindowFromPoint`` returns the topmost window
-        at a point, so if its top-level owner is not us, we are behind
+        at a point, so anything other than our own handle means we are behind
         something. The point comes from ``GetWindowRect`` rather than
         ``frameGeometry()`` so both sides are native pixels - Qt geometry is
         logical, and would be wrong on a scaled display.
@@ -2481,17 +2481,17 @@ class AudioFlipWidget(QWidget):
             own = int(self.winId())
             rect = ctypes.wintypes.RECT()
             if not _user32.GetWindowRect(own, ctypes.byref(rect)):
-                return False
+                return 0
             point = ctypes.wintypes.POINT(
                 (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2,
             )
             hwnd = _user32.WindowFromPoint(point)
             if not hwnd:
-                return True
-            return int(_user32.GetAncestor(hwnd, _GA_ROOT) or hwnd) != own
+                return 0
+            return int(_user32.GetAncestor(hwnd, _GA_ROOT) or hwnd)
         except Exception as exc:
-            log.debug("Obscured check failed: %s", exc)
-            return False
+            log.debug("Centre hit test failed: %s", exc)
+            return 0
 
     def surface(self) -> None:
         """Show the widget and hold it above everything for a moment.
@@ -2607,8 +2607,18 @@ class SystemTrayIcon(QSystemTrayIcon):
             # A buried widget is still visible to Qt, so a plain toggle hid
             # something you could not see, and took a second click to bring
             # back - which put it straight back behind the same window.
-            if self._widget.isVisible() and not self._widget.is_obscured():
+            visible = self._widget.isVisible()
+            covering = self._widget.window_over_centre()
+            own = int(self._widget.winId())
+            obscured = covering not in (0, own)
+            log.info(
+                "Tray click: visible=%s obscured=%s own=%s over-centre=%s %s",
+                visible, obscured, own, covering, describe_window(covering),
+            )
+            if visible and not obscured:
                 self._widget.hide()
+                log.info("Tray click: hid widget, isVisible now %s",
+                         self._widget.isVisible())
             else:
                 self._widget.surface()
         elif reason == QSystemTrayIcon.ActivationReason.Context:
