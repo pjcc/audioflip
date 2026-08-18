@@ -215,6 +215,12 @@ _THEMES: dict[str, dict[str, str]] = {
 _RADIUS = 10
 _FONT_FAMILY = "Segoe UI"
 
+# --- Position / screen guard tuning ---
+_MIN_VISIBLE_PX = 24          # a sliver this big on one screen counts as reachable
+_MIN_VISIBLE_FRACTION = 0.5   # otherwise at least half the widget must be on-screen
+_SCREEN_SETTLE_MS = 900       # debounce for a burst of display-change events
+_STARTUP_GRACE_SECONDS = 10.0  # let late monitors (DisplayPort, docks) arrive
+
 
 def _rounded_mask(width: int, height: int, radius: int) -> QBitmap:
     """Create a pixel-perfect rounded-rect mask via QBitmap + QPainter."""
@@ -1211,13 +1217,22 @@ class AudioFlipWidget(QWidget):
         # monitor it belongs on comes back.
         pos = self._config_mgr.config.position
         self._desired_pos = QPoint(pos.get("x", 100), pos.get("y", 100))
-        self.move(self._desired_pos)
-        self._ensure_on_screen()
+        self._position_restored = False
+        self._startup_grace_until = time.monotonic() + _STARTUP_GRACE_SECONDS
+        self.move(self._desired_pos)  # rough placement; showEvent does it properly
 
-        # Re-check position when a monitor is disconnected
+        # Re-check position whenever the display layout changes, debounced
+        # through a single settle timer (docking emits a burst of events).
+        self._watched_screens: set[str] = set()
+        self._screen_settle_timer = QTimer(self)
+        self._screen_settle_timer.setSingleShot(True)
+        self._screen_settle_timer.timeout.connect(self._ensure_on_screen)
         app = QApplication.instance()
         if app is not None:
-            app.screenRemoved.connect(self._on_screen_removed)
+            app.screenAdded.connect(self._on_screens_changed)
+            app.screenRemoved.connect(self._on_screens_changed)
+            app.primaryScreenChanged.connect(self._on_screens_changed)
+        self._connect_screen_signals()
 
         # Apply always-on-top from config
         self._apply_always_on_top(self._config_mgr.config.always_on_top)
@@ -1257,13 +1272,55 @@ class AudioFlipWidget(QWidget):
 
     # --- Screen / position guard -------------------------------------------
 
+    def _rect_is_visible(self, rect: QRect) -> bool:
+        """Return True if enough of *rect* falls on a physical screen.
+
+        Tests against each screen's full geometry(), NOT availableGeometry().
+        This widget is designed to float above the taskbar, so a position
+        overlapping the taskbar strip is deliberate and must not count as
+        off-screen. Using availableGeometry() here evicted the widget on
+        every startup for anyone who parked it over the taskbar.
+        """
+        area = rect.width() * rect.height()
+        if area <= 0:
+            return False
+
+        visible = 0
+        for screen in QApplication.screens():
+            inter = rect.intersected(screen.geometry())
+            if inter.isValid():
+                visible += inter.width() * inter.height()
+                # A decent sliver on one screen is enough to be reachable
+                if inter.width() >= _MIN_VISIBLE_PX and inter.height() >= _MIN_VISIBLE_PX:
+                    return True
+        return visible >= area * _MIN_VISIBLE_FRACTION
+
     def _position_is_visible(self, pos: QPoint) -> bool:
-        """Return True if the widget would be on a visible screen at *pos*."""
-        centre = QPoint(pos.x() + self.width() // 2, pos.y() + self.height() // 2)
-        return any(
-            screen.availableGeometry().contains(centre)
-            for screen in QApplication.screens()
-        )
+        """Return True if the widget would be visible at *pos*."""
+        return self._rect_is_visible(QRect(pos, self.size()))
+
+    def _clamp_to_nearest_screen(self, rect: QRect) -> QPoint:
+        """Return the closest position that puts *rect* fully on one screen.
+
+        Nudges the widget back into view rather than teleporting it to the
+        centre of the primary screen, so the user's intent is preserved.
+        """
+        screens = QApplication.screens()
+        if not screens:
+            return rect.topLeft()
+
+        centre = rect.center()
+
+        def _distance(screen: object) -> int:
+            sc = screen.geometry().center()
+            dx = sc.x() - centre.x()
+            dy = sc.y() - centre.y()
+            return dx * dx + dy * dy
+
+        geo = min(screens, key=_distance).geometry()
+        x = max(geo.left(), min(rect.left(), geo.right() - rect.width() + 1))
+        y = max(geo.top(), min(rect.top(), geo.bottom() - rect.height() + 1))
+        return QPoint(x, y)
 
     def _save_desired_position(self, x: int, y: int) -> None:
         """Record a position the user deliberately chose, and persist it.
@@ -1298,24 +1355,64 @@ class AudioFlipWidget(QWidget):
         if self._position_is_visible(self.pos()):
             return
 
-        # Nothing visible: park on the primary screen WITHOUT saving, so the
-        # desired position survives for when its monitor returns.
-        primary = QApplication.primaryScreen()
-        if primary is None:
+        # At startup the display list may still be filling in (DisplayPort
+        # monitors and docks arrive late), so retry for a while before giving
+        # up and moving the widget.
+        if time.monotonic() < self._startup_grace_until:
+            log.info(
+                "Desired position (%d, %d) not visible yet - retrying during startup grace",
+                self._desired_pos.x(), self._desired_pos.y(),
+            )
+            self._screen_settle_timer.start(_SCREEN_SETTLE_MS)
             return
-        geo = primary.availableGeometry()
-        x = geo.x() + (geo.width() - self.width()) // 2
-        y = geo.y() + (geo.height() - self.height()) // 2
-        log.info(
-            "Widget off-screen - parking at (%d, %d); desired position (%d, %d) preserved",
-            x, y, self._desired_pos.x(), self._desired_pos.y(),
-        )
-        self.move(x, y)
 
-    def _on_screen_removed(self, _screen: object) -> None:
-        """Called when a monitor is disconnected."""
-        # Short delay so Qt can update its screen list before we check
-        QTimer.singleShot(500, self._ensure_on_screen)
+        # Nothing visible: clamp into the nearest screen WITHOUT saving, so
+        # the desired position survives for when its monitor returns.
+        target = self._clamp_to_nearest_screen(QRect(self._desired_pos, self.size()))
+        log.info(
+            "Widget off-screen - clamping to (%d, %d); desired position (%d, %d) preserved",
+            target.x(), target.y(), self._desired_pos.x(), self._desired_pos.y(),
+        )
+        self.move(target)
+
+    def _connect_screen_signals(self) -> None:
+        """Watch every current screen for geometry and DPI changes."""
+        present: set[str] = set()
+        for screen in QApplication.screens():
+            name = screen.name()
+            present.add(name)
+            if name in self._watched_screens:
+                continue
+            screen.geometryChanged.connect(self._on_screens_changed)
+            screen.availableGeometryChanged.connect(self._on_screens_changed)
+            screen.logicalDotsPerInchChanged.connect(self._on_screens_changed)
+        # Drop names that have gone away so they reconnect if they come back
+        self._watched_screens = present
+
+    def _on_screens_changed(self, *_args: object) -> None:
+        """Any monitor add/remove/resize/DPI change lands here.
+
+        Docking emits a burst of these, so restart a single settle timer
+        rather than acting on each one; the check runs once things are stable.
+        """
+        self._connect_screen_signals()
+        self._screen_settle_timer.start(_SCREEN_SETTLE_MS)
+
+    def showEvent(self, event: object) -> None:
+        """Apply the saved position once the widget's real size is known.
+
+        The size is still a placeholder during __init__, so any visibility
+        check there is computed against the wrong rectangle.
+        """
+        super().showEvent(event)
+        if self._position_restored:
+            return
+        self._position_restored = True
+        self.move(self._desired_pos)
+        self._ensure_on_screen()
+        # Re-check on the next event-loop turn, after Qt has settled which
+        # screen the window actually landed on (and rescaled it if needed)
+        QTimer.singleShot(0, self._ensure_on_screen)
 
     def _move_to_screen(self) -> None:
         """Move the widget to the centre of the current primary screen."""
