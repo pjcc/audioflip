@@ -616,6 +616,61 @@ def _win32_disconnect(device_name: str) -> bool:
 # ---------------------------------------------------------------------------
 # PowerShell PnP fallback
 # ---------------------------------------------------------------------------
+def _ps_single_quote(value: str) -> str:
+    """Quote a value for a PowerShell single-quoted string literal."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _run_powershell(script: str, timeout: int = 15) -> "subprocess.CompletedProcess | None":
+    """Run a PowerShell snippet, returning None if it could not be launched.
+
+    Uses an argument list rather than shell=True. The old form built a single
+    command string and pushed it through cmd.exe, which does not process
+    backslash escapes, so the intended '-Confirm:$false' reached PowerShell
+    with a stray backslash and was rejected as a string where a switch was
+    required. That made the PnP fallback fail every single time.
+
+    CREATE_NO_WINDOW stops a console window flashing over the screen on every
+    Bluetooth fallback attempt.
+    """
+    try:
+        return subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception as exc:
+        log.debug("PowerShell invocation failed: %s", exc)
+        return None
+
+
+def _pnp_set_enabled(instance_id: str, enable: bool) -> bool:
+    """Enable or disable a PnP device via PowerShell."""
+    verb = "Enable" if enable else "Disable"
+    result = _run_powershell(
+        f"{verb}-PnpDevice -InstanceId {_ps_single_quote(instance_id)} "
+        f"-Confirm:$false -ErrorAction Stop"
+    )
+    if result is None:
+        log.warning("PowerShell: %s-PnpDevice could not be launched", verb)
+        return False
+    if result.returncode == 0:
+        log.info("PowerShell: %s-PnpDevice succeeded for %s", verb, instance_id)
+        return True
+
+    stderr = (result.stderr or "").strip()
+    if "denied" in stderr.lower() or "administrator" in stderr.lower():
+        log.warning(
+            "PowerShell: %s-PnpDevice needs admin privileges "
+            "(audioflip must run elevated for this fallback)", verb,
+        )
+    else:
+        log.warning("PowerShell: %s-PnpDevice failed: %s", verb, stderr)
+    return False
+
+
 def _find_bt_pnp_instance_id(device_name: str) -> str | None:
     """Find the PnP instance ID for a Bluetooth device by name.
 
@@ -623,21 +678,17 @@ def _find_bt_pnp_instance_id(device_name: str) -> str | None:
     friendly name (case-insensitive substring).
     """
     name_lower = device_name.lower()
-    cmd = (
-        'powershell -NoProfile -Command "'
+    result = _run_powershell(
         "Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue "
         "| Select-Object InstanceId, FriendlyName, Status "
-        '| ConvertTo-Json -Compress"'
+        "| ConvertTo-Json -Compress",
+        timeout=10,
     )
-    try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=10,
+    if result is None or result.returncode != 0:
+        log.debug(
+            "Get-PnpDevice failed: %s",
+            result.stderr.strip() if result else "could not launch PowerShell",
         )
-        if result.returncode != 0:
-            log.debug("Get-PnpDevice failed: %s", result.stderr.strip())
-            return None
-    except Exception as exc:
-        log.debug("Get-PnpDevice exception: %s", exc)
         return None
 
     try:
@@ -667,52 +718,12 @@ def _find_bt_pnp_instance_id(device_name: str) -> str | None:
 
 def _powershell_enable(instance_id: str) -> bool:
     """Enable a PnP device (reconnect) via PowerShell."""
-    cmd = (
-        f'powershell -NoProfile -Command "'
-        f"Enable-PnpDevice -InstanceId '{instance_id}' -Confirm:\\$false"
-        f' -ErrorAction Stop"'
-    )
-    try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode == 0:
-            log.info("PowerShell: Enable-PnpDevice succeeded for %s", instance_id)
-            return True
-        stderr = result.stderr.strip()
-        if "Access" in stderr or "denied" in stderr or "administrator" in stderr.lower():
-            log.warning("PowerShell: Enable-PnpDevice needs admin privileges")
-        else:
-            log.warning("PowerShell: Enable-PnpDevice failed: %s", stderr)
-        return False
-    except Exception as exc:
-        log.warning("PowerShell: Enable-PnpDevice exception: %s", exc)
-        return False
+    return _pnp_set_enabled(instance_id, True)
 
 
 def _powershell_disable(instance_id: str) -> bool:
     """Disable a PnP device (disconnect) via PowerShell."""
-    cmd = (
-        f'powershell -NoProfile -Command "'
-        f"Disable-PnpDevice -InstanceId '{instance_id}' -Confirm:\\$false"
-        f' -ErrorAction Stop"'
-    )
-    try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode == 0:
-            log.info("PowerShell: Disable-PnpDevice succeeded for %s", instance_id)
-            return True
-        stderr = result.stderr.strip()
-        if "Access" in stderr or "denied" in stderr or "administrator" in stderr.lower():
-            log.warning("PowerShell: Disable-PnpDevice needs admin privileges")
-        else:
-            log.warning("PowerShell: Disable-PnpDevice failed: %s", stderr)
-        return False
-    except Exception as exc:
-        log.warning("PowerShell: Disable-PnpDevice exception: %s", exc)
-        return False
+    return _pnp_set_enabled(instance_id, False)
 
 
 def _powershell_connect(device_name: str) -> bool:
