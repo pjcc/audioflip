@@ -123,6 +123,8 @@ _HWND_NOTOPMOST = ctypes.wintypes.HWND(-2)
 _MONITOR_DEFAULTTONEAREST = 0x0002
 _FULLSCREEN_TOLERANCE_PX = 2   # some apps miss the monitor rect by a pixel
 _FULLSCREEN_CLEAR_TICKS = 2    # consecutive clear polls before restoring topmost
+_GWL_EXSTYLE = -20
+_WS_EX_TOPMOST = 0x00000008
 
 # Desktop and shell windows cover the whole monitor at all times and must
 # never count as a fullscreen app.
@@ -167,6 +169,16 @@ def _setup_fullscreen_prototypes() -> None:
         ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.DWORD),
     ]
     _user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+    _user32.GetWindowLongW.argtypes = [ctypes.wintypes.HWND, ctypes.c_int]
+    _user32.GetWindowLongW.restype = ctypes.wintypes.LONG
+    # Prototyped so a handle above 2^31 is not truncated when we insert the
+    # widget behind another window's HWND.
+    _user32.SetWindowPos.argtypes = [
+        ctypes.wintypes.HWND, ctypes.wintypes.HWND,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.wintypes.UINT,
+    ]
+    _user32.SetWindowPos.restype = ctypes.wintypes.BOOL
 
 
 _setup_fullscreen_prototypes()
@@ -195,13 +207,11 @@ def covers_monitor(
     )
 
 
-def foreground_fullscreen_monitor() -> QRect | None:
-    """Return the monitor rect covered by a fullscreen foreground window.
+def foreground_candidate_hwnd() -> int | None:
+    """Return the foreground HWND, or None if it can never be a fullscreen app.
 
-    Returns None when the foreground window is not fullscreen. Compares the
-    window against the monitor's rcMonitor (the whole display), never rcWork,
-    so a merely *maximised* window - which covers rcWork but leaves the
-    taskbar visible - correctly does not count.
+    Filters out the desktop, the shell surfaces, and our own windows - a
+    dropdown of ours going foreground must never make us yield.
     """
     try:
         hwnd = _user32.GetForegroundWindow()
@@ -210,7 +220,6 @@ def foreground_fullscreen_monitor() -> QRect | None:
         if hwnd in (_user32.GetShellWindow(), _user32.GetDesktopWindow()):
             return None
 
-        # Our own popups must never make us yield
         pid = ctypes.wintypes.DWORD()
         _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         if pid.value == _OWN_PID:
@@ -220,7 +229,43 @@ def foreground_fullscreen_monitor() -> QRect | None:
         _user32.GetClassNameW(hwnd, buf, 256)
         if buf.value in _EXCLUDED_FULLSCREEN_CLASSES:
             return None
+        return int(hwnd)
+    except Exception as exc:
+        log.debug("Foreground window lookup failed: %s", exc)
+        return None
 
+
+def describe_window(hwnd: int | None) -> str:
+    """Class name and z-order band of *hwnd*, for the yield log.
+
+    The band is the whole reason yielding is not a one-liner: a borderless
+    fullscreen window sits in the normal band, where HWND_NOTOPMOST alone
+    would still leave us above it.
+    """
+    if not hwnd:
+        return "no window (exclusive fullscreen)"
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        _user32.GetClassNameW(hwnd, buf, 256)
+        exstyle = _user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
+        band = "topmost" if exstyle & _WS_EX_TOPMOST else "normal"
+        return f"class={buf.value!r} band={band}"
+    except Exception as exc:
+        return f"undescribable ({exc})"
+
+
+def foreground_fullscreen_window() -> tuple[int, QRect] | None:
+    """Return the fullscreen foreground window and the monitor it covers.
+
+    Returns None when the foreground window is not fullscreen. Compares the
+    window against the monitor's rcMonitor (the whole display), never rcWork,
+    so a merely *maximised* window - which covers rcWork but leaves the
+    taskbar visible - correctly does not count.
+    """
+    hwnd = foreground_candidate_hwnd()
+    if hwnd is None:
+        return None
+    try:
         rect = ctypes.wintypes.RECT()
         if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             return None
@@ -239,7 +284,7 @@ def foreground_fullscreen_monitor() -> QRect | None:
             (mon.left, mon.top, mon.right, mon.bottom),
         ):
             return None
-        return QRect(
+        return hwnd, QRect(
             mon.left, mon.top, mon.right - mon.left, mon.bottom - mon.top,
         )
     except Exception as exc:
@@ -1364,6 +1409,7 @@ class AudioFlipWidget(QWidget):
         self._bt_retry_name: str | None = None  # kept for the 4s retry (not cleared by _set_pending)
         self._fullscreen_yielding = False  # True while demoted for a fullscreen app
         self._fullscreen_clear_ticks = 0
+        self._fullscreen_hwnd = 0          # window we are currently sitting behind
 
         # Build body container
         self._body = _BodyWidget(self)
@@ -2286,6 +2332,7 @@ class AudioFlipWidget(QWidget):
         """Forget any in-progress yield so the next tick starts clean."""
         self._fullscreen_yielding = False
         self._fullscreen_clear_ticks = 0
+        self._fullscreen_hwnd = 0
 
     def _apply_always_on_top(self, on_top: bool) -> None:
         """Apply always-on-top using Win32 SetWindowPos for true taskbar-level topmost."""
@@ -2316,19 +2363,31 @@ class AudioFlipWidget(QWidget):
                 self._topmost_timer.stop()
 
     def _should_yield_to_fullscreen(self) -> bool:
-        """Return True if a fullscreen app should take precedence over us."""
+        """Return True if a fullscreen app should take precedence over us.
+
+        Records the window to sit behind in ``self._fullscreen_hwnd``, or 0
+        when the fullscreen app has no usable window of its own.
+        """
+        self._fullscreen_hwnd = 0
         if not self._config_mgr.config.yield_to_fullscreen:
             return False
 
-        monitor = foreground_fullscreen_monitor()
-        if monitor is not None:
+        found = foreground_fullscreen_window()
+        if found is not None:
+            hwnd, monitor = found
             # Only yield when the fullscreen app is on OUR monitor - fullscreen
             # video on a second screen should not demote the widget.
-            return monitor.contains(self.frameGeometry().center())
+            if not monitor.contains(self.frameGeometry().center()):
+                return False
+            self._fullscreen_hwnd = hwnd
+            return True
 
         # Exclusive-mode D3D games: no usable window rect, so no monitor to
         # compare against. Yield unconditionally.
-        return shell_reports_fullscreen()
+        if shell_reports_fullscreen():
+            self._fullscreen_hwnd = foreground_candidate_hwnd() or 0
+            return True
+        return False
 
     def _reassert_topmost(self) -> None:
         """Re-assert HWND_TOPMOST silently — no activate, no flash.
@@ -2344,8 +2403,14 @@ class AudioFlipWidget(QWidget):
             self._fullscreen_clear_ticks = 0
             if not self._fullscreen_yielding:
                 self._fullscreen_yielding = True
-                log.info("Fullscreen app detected - yielding always-on-top")
-                self._set_topmost(False)
+                log.info(
+                    "Fullscreen app detected - yielding always-on-top (%s)",
+                    describe_window(self._fullscreen_hwnd),
+                )
+            # Re-applied every tick, not just on the transition: any window
+            # activation reorders us, and the fullscreen app may re-raise
+            # itself at any time.
+            self._yield_below(self._fullscreen_hwnd)
             return
 
         if self._fullscreen_yielding:
@@ -2359,6 +2424,37 @@ class AudioFlipWidget(QWidget):
             log.info("Fullscreen app gone - restoring always-on-top")
 
         self._set_topmost(True)
+
+    def _yield_below(self, hwnd_above: int) -> None:
+        """Place the widget directly behind *hwnd_above* in the z-order.
+
+        HWND_NOTOPMOST is not enough on its own. Windows defines it as *above
+        all non-topmost windows*, so it only drops us out of the topmost band
+        and leaves us at the top of the ordinary one - still floating over
+        borderless-windowed fullscreen apps (most games, Stremio), which are
+        ordinary non-topmost windows and, being already active, are never
+        re-raised above us by a click. Chrome's fullscreen window happens to
+        end up above us, which is why that one case appeared to work.
+
+        Inserting after the fullscreen window itself puts us behind it in
+        either band: Windows drops our WS_EX_TOPMOST automatically when a
+        topmost window is positioned after a non-topmost one.
+        """
+        own = int(self.winId())
+        if not hwnd_above or hwnd_above == own:
+            # Exclusive fullscreen: nothing to sit behind, so the band drop is
+            # all we can do - the game owns the display anyway.
+            self._set_topmost(False)
+            return
+        _user32.SetWindowPos(
+            own,
+            hwnd_above,
+            0,
+            0,
+            0,
+            0,
+            _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE,
+        )
 
     def _set_topmost(self, on_top: bool) -> None:
         """Raw z-order change, without touching the re-assertion timer."""
