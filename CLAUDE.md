@@ -18,7 +18,12 @@ Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 .venv\Scripts\python.exe -m PyInstaller audioflip.spec
 ```
 
-There is no test suite, linter, or formatter configured. Verification is manual: run the app and exercise the affected path.
+```powershell
+# Tests (dependency-free, no pytest required)
+.venv\Scripts\python.exe tests	est_fullscreen.py
+```
+
+There is no linter or formatter configured, and test coverage is limited to pure geometry helpers. Anything touching Win32, COM or Qt is verified manually: run the app and exercise the affected path.
 
 Runtime state lives outside the repo:
 
@@ -54,6 +59,7 @@ Refresh is deliberately doubled up: an `IMMNotificationClient` COM callback plus
 ### UI conventions worth knowing before editing `ui.py`
 
 - Always-on-top is not the Qt flag alone. `SetWindowPos(HWND_TOPMOST)` is re-asserted every 500 ms so the widget sits above the taskbar. That timer is stopped while the context menu is open, otherwise the widget pushes back through its own menu, and restarted in `_restore_topmost_after_menu`
+- The same 500 ms tick drives the fullscreen yield. `covers_monitor()` compares the foreground window against the monitor's `rcMonitor`, never `rcWork` - a maximised window covers `rcWork` and must not count as fullscreen. The widget demotes immediately but needs two consecutive clear ticks before restoring, so alt-tab does not flicker the z-order. Yielding must use `_set_topmost(False)` and not `_apply_always_on_top(False)`, which would stop the timer and strand it demoted
 - Native popup windows bleed square corners through a stylesheet `border-radius`, so every popup applies a manual `QBitmap` mask via `_rounded_mask()` after any resize
 - Custom `QWidget` subclasses do not paint their own stylesheet. `_BodyWidget.paintEvent` must call `style().drawPrimitive(PE_Widget, ...)` explicitly before drawing anything else
 - The volume bar is painted inside `_BodyWidget.paintEvent` rather than as a child overlay, to avoid parent/child repaint flicker
@@ -63,6 +69,15 @@ Refresh is deliberately doubled up: an `IMMNotificationClient` COM callback plus
 - Dropdown grow direction flips favourite ordering. When it grows upward, favourites render at the bottom so they stay nearest the cursor
 - Disconnected favourites are synthesised as `AudioDevice(is_connected=False)` ghost rows from cached config metadata, drawn at 40% icon opacity
 - Themes are plain dicts of seven colour keys in `_THEMES`. Adding one means updating both `_THEMES` and `VALID_THEMES` in `config.py`
+
+### Position and screen handling
+
+Two rules here are load-bearing, and both were previously bugs:
+
+- **Visibility is tested against `screen.geometry()`, never `availableGeometry()`.** The widget is designed to float over the taskbar, so a position inside the taskbar strip is deliberate. Testing against `availableGeometry()` (which excludes the taskbar) evicted the widget on every startup for anyone who parked it there
+- **Only deliberate user actions persist a position.** `_save_desired_position()` is the single caller of `ConfigManager.set_position()`, reached from drag-release and 'Move to screen'. The off-screen rescue moves the window but must never save, or the desired position is destroyed the first time its monitor is absent - which is every boot, since audioflip starts before Windows finishes enumerating displays
+
+The authoritative restore runs from `showEvent`, not `__init__`, because the widget's size is still a placeholder during construction and any geometry check there is computed against the wrong rectangle. Display changes are debounced through one settle timer, since docking emits a burst of events.
 
 ## Packaging notes
 
