@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -117,6 +118,154 @@ _HWND_TOPMOST = ctypes.wintypes.HWND(-1)
 _HWND_NOTOPMOST = ctypes.wintypes.HWND(-2)
 
 # ---------------------------------------------------------------------------
+# Fullscreen detection (Win32)
+# ---------------------------------------------------------------------------
+_MONITOR_DEFAULTTONEAREST = 0x0002
+_FULLSCREEN_TOLERANCE_PX = 2   # some apps miss the monitor rect by a pixel
+_FULLSCREEN_CLEAR_TICKS = 2    # consecutive clear polls before restoring topmost
+
+# Desktop and shell windows cover the whole monitor at all times and must
+# never count as a fullscreen app.
+_EXCLUDED_FULLSCREEN_CLASSES = frozenset({
+    "Progman",                  # desktop
+    "WorkerW",                  # desktop wallpaper host
+    "Shell_TrayWnd",            # taskbar
+    "Shell_SecondaryTrayWnd",   # taskbar on secondary monitors
+    "Windows.UI.Core.CoreWindow",  # shell surfaces (Start, search)
+})
+
+# SHQueryUserNotificationState results worth treating as fullscreen
+_QUNS_RUNNING_D3D_FULL_SCREEN = 3
+_QUNS_PRESENTATION_MODE = 4
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("rcMonitor", ctypes.wintypes.RECT),
+        ("rcWork", ctypes.wintypes.RECT),
+        ("dwFlags", ctypes.wintypes.DWORD),
+    ]
+
+
+def _setup_fullscreen_prototypes() -> None:
+    """Declare argtypes/restypes so handles survive on 64-bit."""
+    _user32.GetForegroundWindow.restype = ctypes.wintypes.HWND
+    _user32.GetShellWindow.restype = ctypes.wintypes.HWND
+    _user32.GetDesktopWindow.restype = ctypes.wintypes.HWND
+    _user32.GetWindowRect.argtypes = [ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.RECT)]
+    _user32.GetWindowRect.restype = ctypes.wintypes.BOOL
+    _user32.MonitorFromWindow.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.DWORD]
+    _user32.MonitorFromWindow.restype = ctypes.c_void_p
+    _user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
+    _user32.GetMonitorInfoW.restype = ctypes.wintypes.BOOL
+    _user32.GetClassNameW.argtypes = [
+        ctypes.wintypes.HWND, ctypes.wintypes.LPWSTR, ctypes.c_int,
+    ]
+    _user32.GetClassNameW.restype = ctypes.c_int
+    _user32.GetWindowThreadProcessId.argtypes = [
+        ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.DWORD),
+    ]
+    _user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+
+
+_setup_fullscreen_prototypes()
+_OWN_PID = os.getpid()
+
+
+def covers_monitor(
+    window: tuple[int, int, int, int], monitor: tuple[int, int, int, int]
+) -> bool:
+    """Return True if *window* covers the whole of *monitor*.
+
+    Both are Win32-style (left, top, right, bottom) with exclusive right and
+    bottom edges - deliberately not QRect, whose right()/bottom() are
+    inclusive and would introduce an off-by-one against Win32 RECTs.
+
+    A small tolerance absorbs apps that miss the monitor edge by a pixel.
+    """
+    tol = _FULLSCREEN_TOLERANCE_PX
+    w_left, w_top, w_right, w_bottom = window
+    m_left, m_top, m_right, m_bottom = monitor
+    return (
+        w_left <= m_left + tol
+        and w_top <= m_top + tol
+        and w_right >= m_right - tol
+        and w_bottom >= m_bottom - tol
+    )
+
+
+def foreground_fullscreen_monitor() -> QRect | None:
+    """Return the monitor rect covered by a fullscreen foreground window.
+
+    Returns None when the foreground window is not fullscreen. Compares the
+    window against the monitor's rcMonitor (the whole display), never rcWork,
+    so a merely *maximised* window - which covers rcWork but leaves the
+    taskbar visible - correctly does not count.
+    """
+    try:
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        if hwnd in (_user32.GetShellWindow(), _user32.GetDesktopWindow()):
+            return None
+
+        # Our own popups must never make us yield
+        pid = ctypes.wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == _OWN_PID:
+            return None
+
+        buf = ctypes.create_unicode_buffer(256)
+        _user32.GetClassNameW(hwnd, buf, 256)
+        if buf.value in _EXCLUDED_FULLSCREEN_CLASSES:
+            return None
+
+        rect = ctypes.wintypes.RECT()
+        if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+
+        hmon = _user32.MonitorFromWindow(hwnd, _MONITOR_DEFAULTTONEAREST)
+        if not hmon:
+            return None
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not _user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+            return None
+
+        mon = info.rcMonitor
+        if not covers_monitor(
+            (rect.left, rect.top, rect.right, rect.bottom),
+            (mon.left, mon.top, mon.right, mon.bottom),
+        ):
+            return None
+        return QRect(
+            mon.left, mon.top, mon.right - mon.left, mon.bottom - mon.top,
+        )
+    except Exception as exc:
+        log.debug("Fullscreen detection failed: %s", exc)
+        return None
+
+
+def shell_reports_fullscreen() -> bool:
+    """Secondary check for exclusive-mode D3D games and presentation mode.
+
+    The window-rect test can miss exclusive fullscreen, where the game does
+    not own a normal desktop-sized window. This cannot tell us *which*
+    monitor is involved, so callers should treat it as unconditional.
+    """
+    try:
+        state = ctypes.c_int()
+        if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) != 0:
+            return False
+        return state.value in (
+            _QUNS_RUNNING_D3D_FULL_SCREEN, _QUNS_PRESENTATION_MODE,
+        )
+    except Exception as exc:
+        log.debug("SHQueryUserNotificationState failed: %s", exc)
+        return False
+
+# ---------------------------------------------------------------------------
 # Theme definitions
 # ---------------------------------------------------------------------------
 _THEMES: dict[str, dict[str, str]] = {
@@ -214,6 +363,12 @@ _THEMES: dict[str, dict[str, str]] = {
 
 _RADIUS = 10
 _FONT_FAMILY = "Segoe UI"
+
+# --- Position / screen guard tuning ---
+_MIN_VISIBLE_PX = 24          # a sliver this big on one screen counts as reachable
+_MIN_VISIBLE_FRACTION = 0.5   # otherwise at least half the widget must be on-screen
+_SCREEN_SETTLE_MS = 900       # debounce for a burst of display-change events
+_STARTUP_GRACE_SECONDS = 10.0  # let late monitors (DisplayPort, docks) arrive
 
 
 def _rounded_mask(width: int, height: int, radius: int) -> QBitmap:
@@ -1174,6 +1329,8 @@ class AudioFlipWidget(QWidget):
         self._bt_pending_device_name: str | None = None  # device name for name-based fallback
         self._bt_active_device_id: str | None = None  # device ID the dropdown is showing status for
         self._bt_retry_name: str | None = None  # kept for the 4s retry (not cleared by _set_pending)
+        self._fullscreen_yielding = False  # True while demoted for a fullscreen app
+        self._fullscreen_clear_ticks = 0
 
         # Build body container
         self._body = _BodyWidget(self)
@@ -1205,15 +1362,28 @@ class AudioFlipWidget(QWidget):
         # Apply theme
         self._apply_theme()
 
-        # Restore position and ensure it's on a visible screen
+        # Restore position and ensure it's on a visible screen.
+        # _desired_pos is the position the user chose; it is never overwritten
+        # by the off-screen rescue, so the widget can return to it when the
+        # monitor it belongs on comes back.
         pos = self._config_mgr.config.position
-        self.move(pos.get("x", 100), pos.get("y", 100))
-        self._ensure_on_screen()
+        self._desired_pos = QPoint(pos.get("x", 100), pos.get("y", 100))
+        self._position_restored = False
+        self._startup_grace_until = time.monotonic() + _STARTUP_GRACE_SECONDS
+        self.move(self._desired_pos)  # rough placement; showEvent does it properly
 
-        # Re-check position when a monitor is disconnected
+        # Re-check position whenever the display layout changes, debounced
+        # through a single settle timer (docking emits a burst of events).
+        self._watched_screens: set[str] = set()
+        self._screen_settle_timer = QTimer(self)
+        self._screen_settle_timer.setSingleShot(True)
+        self._screen_settle_timer.timeout.connect(self._ensure_on_screen)
         app = QApplication.instance()
         if app is not None:
-            app.screenRemoved.connect(self._on_screen_removed)
+            app.screenAdded.connect(self._on_screens_changed)
+            app.screenRemoved.connect(self._on_screens_changed)
+            app.primaryScreenChanged.connect(self._on_screens_changed)
+        self._connect_screen_signals()
 
         # Apply always-on-top from config
         self._apply_always_on_top(self._config_mgr.config.always_on_top)
@@ -1253,27 +1423,147 @@ class AudioFlipWidget(QWidget):
 
     # --- Screen / position guard -------------------------------------------
 
-    def _ensure_on_screen(self) -> None:
-        """If the widget centre is not within any visible screen, move it."""
-        centre = self.geometry().center()
+    def _rect_is_visible(self, rect: QRect) -> bool:
+        """Return True if enough of *rect* falls on a physical screen.
+
+        Tests against each screen's full geometry(), NOT availableGeometry().
+        This widget is designed to float above the taskbar, so a position
+        overlapping the taskbar strip is deliberate and must not count as
+        off-screen. Using availableGeometry() here evicted the widget on
+        every startup for anyone who parked it over the taskbar.
+        """
+        area = rect.width() * rect.height()
+        if area <= 0:
+            return False
+
+        visible = 0
         for screen in QApplication.screens():
-            if screen.availableGeometry().contains(centre):
-                return  # visible — nothing to do
-        # Off-screen: move to centre of primary screen
-        primary = QApplication.primaryScreen()
-        if primary is None:
-            return
-        geo = primary.availableGeometry()
-        x = geo.x() + (geo.width() - self.width()) // 2
-        y = geo.y() + (geo.height() - self.height()) // 2
-        log.info("Widget off-screen — relocating to (%d, %d)", x, y)
-        self.move(x, y)
+            inter = rect.intersected(screen.geometry())
+            if inter.isValid():
+                visible += inter.width() * inter.height()
+                # A decent sliver on one screen is enough to be reachable
+                if inter.width() >= _MIN_VISIBLE_PX and inter.height() >= _MIN_VISIBLE_PX:
+                    return True
+        return visible >= area * _MIN_VISIBLE_FRACTION
+
+    def _position_is_visible(self, pos: QPoint) -> bool:
+        """Return True if the widget would be visible at *pos*."""
+        return self._rect_is_visible(QRect(pos, self.size()))
+
+    def _clamp_to_nearest_screen(self, rect: QRect) -> QPoint:
+        """Return the closest position that puts *rect* fully on one screen.
+
+        Nudges the widget back into view rather than teleporting it to the
+        centre of the primary screen, so the user's intent is preserved.
+        """
+        screens = QApplication.screens()
+        if not screens:
+            return rect.topLeft()
+
+        centre = rect.center()
+
+        def _distance(screen: object) -> int:
+            sc = screen.geometry().center()
+            dx = sc.x() - centre.x()
+            dy = sc.y() - centre.y()
+            return dx * dx + dy * dy
+
+        geo = min(screens, key=_distance).geometry()
+        x = max(geo.left(), min(rect.left(), geo.right() - rect.width() + 1))
+        y = max(geo.top(), min(rect.top(), geo.bottom() - rect.height() + 1))
+        return QPoint(x, y)
+
+    def _save_desired_position(self, x: int, y: int) -> None:
+        """Record a position the user deliberately chose, and persist it.
+
+        Only drag-release and 'Move to screen' should call this. The
+        off-screen rescue must not, or the saved position is lost the first
+        time the widget's monitor is absent (e.g. at boot, before Windows
+        has finished enumerating displays).
+        """
+        self._desired_pos = QPoint(x, y)
         self._config_mgr.set_position(x, y)
 
-    def _on_screen_removed(self, _screen: object) -> None:
-        """Called when a monitor is disconnected."""
-        # Short delay so Qt can update its screen list before we check
-        QTimer.singleShot(500, self._ensure_on_screen)
+    def _ensure_on_screen(self) -> None:
+        """Keep the widget visible without ever discarding the desired position.
+
+        Prefers the user's desired position whenever it is visible, so the
+        widget returns home once a disconnected monitor comes back. When
+        nothing is visible it parks the widget on the primary screen, but
+        leaves the stored position untouched.
+        """
+        # Desired position usable - go (back) to it
+        if self._position_is_visible(self._desired_pos):
+            if self.pos() != self._desired_pos:
+                log.info(
+                    "Returning widget to desired position (%d, %d)",
+                    self._desired_pos.x(), self._desired_pos.y(),
+                )
+                self.move(self._desired_pos)
+            return
+
+        # Desired position unusable, but wherever we are now is visible - stay put
+        if self._position_is_visible(self.pos()):
+            return
+
+        # At startup the display list may still be filling in (DisplayPort
+        # monitors and docks arrive late), so retry for a while before giving
+        # up and moving the widget.
+        if time.monotonic() < self._startup_grace_until:
+            log.info(
+                "Desired position (%d, %d) not visible yet - retrying during startup grace",
+                self._desired_pos.x(), self._desired_pos.y(),
+            )
+            self._screen_settle_timer.start(_SCREEN_SETTLE_MS)
+            return
+
+        # Nothing visible: clamp into the nearest screen WITHOUT saving, so
+        # the desired position survives for when its monitor returns.
+        target = self._clamp_to_nearest_screen(QRect(self._desired_pos, self.size()))
+        log.info(
+            "Widget off-screen - clamping to (%d, %d); desired position (%d, %d) preserved",
+            target.x(), target.y(), self._desired_pos.x(), self._desired_pos.y(),
+        )
+        self.move(target)
+
+    def _connect_screen_signals(self) -> None:
+        """Watch every current screen for geometry and DPI changes."""
+        present: set[str] = set()
+        for screen in QApplication.screens():
+            name = screen.name()
+            present.add(name)
+            if name in self._watched_screens:
+                continue
+            screen.geometryChanged.connect(self._on_screens_changed)
+            screen.availableGeometryChanged.connect(self._on_screens_changed)
+            screen.logicalDotsPerInchChanged.connect(self._on_screens_changed)
+        # Drop names that have gone away so they reconnect if they come back
+        self._watched_screens = present
+
+    def _on_screens_changed(self, *_args: object) -> None:
+        """Any monitor add/remove/resize/DPI change lands here.
+
+        Docking emits a burst of these, so restart a single settle timer
+        rather than acting on each one; the check runs once things are stable.
+        """
+        self._connect_screen_signals()
+        self._screen_settle_timer.start(_SCREEN_SETTLE_MS)
+
+    def showEvent(self, event: object) -> None:
+        """Apply the saved position once the widget's real size is known.
+
+        The size is still a placeholder during __init__, so any visibility
+        check there is computed against the wrong rectangle.
+        """
+        super().showEvent(event)
+        if self._position_restored:
+            return
+        self._position_restored = True
+        self.move(self._desired_pos)
+        self._ensure_on_screen()
+        # Re-check on the next event-loop turn, after Qt has settled which
+        # screen the window actually landed on (and rescaled it if needed)
+        QTimer.singleShot(0, self._ensure_on_screen)
 
     def _move_to_screen(self) -> None:
         """Move the widget to the centre of the current primary screen."""
@@ -1284,7 +1574,7 @@ class AudioFlipWidget(QWidget):
         x = geo.x() + (geo.width() - self.width()) // 2
         y = geo.y() + (geo.height() - self.height()) // 2
         self.move(x, y)
-        self._config_mgr.set_position(x, y)
+        self._save_desired_position(x, y)
         self.show()
         self._apply_always_on_top(self._config_mgr.config.always_on_top)
 
@@ -1448,7 +1738,7 @@ class AudioFlipWidget(QWidget):
             if self._drag_offset is not None:
                 if not self._dragged:
                     self._open_dropdown()
-                self._config_mgr.set_position(self.x(), self.y())
+                self._save_desired_position(self.x(), self.y())
             self._reset_drag()
 
     def _open_dropdown(self) -> None:
@@ -1750,6 +2040,14 @@ class AudioFlipWidget(QWidget):
         aot_action.triggered.connect(self._toggle_always_on_top)
         menu.addAction(aot_action)
 
+        # Yield to fullscreen apps (only meaningful while always-on-top is on)
+        yield_action = QAction("Yield to fullscreen apps", self)
+        yield_action.setCheckable(True)
+        yield_action.setChecked(self._config_mgr.config.yield_to_fullscreen)
+        yield_action.setEnabled(self._config_mgr.config.always_on_top)
+        yield_action.triggered.connect(self._toggle_yield_to_fullscreen)
+        menu.addAction(yield_action)
+
         # Flash on change
         flash_action = QAction("Flash on change", self)
         flash_action.setCheckable(True)
@@ -1922,7 +2220,22 @@ class AudioFlipWidget(QWidget):
 
     def _toggle_always_on_top(self, checked: bool) -> None:
         self._config_mgr.set_always_on_top(checked)
+        self._clear_fullscreen_yield()
         self._apply_always_on_top(checked)
+
+    def _toggle_yield_to_fullscreen(self, checked: bool) -> None:
+        self._config_mgr.set_yield_to_fullscreen(checked)
+        if not checked:
+            # Turning it off while demoted must restore topmost immediately,
+            # rather than waiting for the fullscreen app to close.
+            self._clear_fullscreen_yield()
+            if self._config_mgr.config.always_on_top:
+                self._set_topmost(True)
+
+    def _clear_fullscreen_yield(self) -> None:
+        """Forget any in-progress yield so the next tick starts clean."""
+        self._fullscreen_yielding = False
+        self._fullscreen_clear_ticks = 0
 
     def _apply_always_on_top(self, on_top: bool) -> None:
         """Apply always-on-top using Win32 SetWindowPos for true taskbar-level topmost."""
@@ -1952,14 +2265,56 @@ class AudioFlipWidget(QWidget):
             if hasattr(self, "_topmost_timer"):
                 self._topmost_timer.stop()
 
+    def _should_yield_to_fullscreen(self) -> bool:
+        """Return True if a fullscreen app should take precedence over us."""
+        if not self._config_mgr.config.yield_to_fullscreen:
+            return False
+
+        monitor = foreground_fullscreen_monitor()
+        if monitor is not None:
+            # Only yield when the fullscreen app is on OUR monitor - fullscreen
+            # video on a second screen should not demote the widget.
+            return monitor.contains(self.frameGeometry().center())
+
+        # Exclusive-mode D3D games: no usable window rect, so no monitor to
+        # compare against. Yield unconditionally.
+        return shell_reports_fullscreen()
+
     def _reassert_topmost(self) -> None:
-        """Re-assert HWND_TOPMOST silently — no activate, no flash."""
+        """Re-assert HWND_TOPMOST silently — no activate, no flash.
+
+        Also drives the fullscreen yield: while a fullscreen app is active on
+        our monitor the widget drops to NOTOPMOST, and the timer keeps running
+        so we can detect the app exiting.
+        """
         if not self._config_mgr.config.always_on_top:
             return
-        hwnd = int(self.winId())
+
+        if self._should_yield_to_fullscreen():
+            self._fullscreen_clear_ticks = 0
+            if not self._fullscreen_yielding:
+                self._fullscreen_yielding = True
+                log.info("Fullscreen app detected - yielding always-on-top")
+                self._set_topmost(False)
+            return
+
+        if self._fullscreen_yielding:
+            # Require consecutive clear polls, otherwise alt-tabbing out of a
+            # game flickers the widget between z-orders.
+            self._fullscreen_clear_ticks += 1
+            if self._fullscreen_clear_ticks < _FULLSCREEN_CLEAR_TICKS:
+                return
+            self._fullscreen_yielding = False
+            self._fullscreen_clear_ticks = 0
+            log.info("Fullscreen app gone - restoring always-on-top")
+
+        self._set_topmost(True)
+
+    def _set_topmost(self, on_top: bool) -> None:
+        """Raw z-order change, without touching the re-assertion timer."""
         _user32.SetWindowPos(
-            hwnd,
-            _HWND_TOPMOST,
+            int(self.winId()),
+            _HWND_TOPMOST if on_top else _HWND_NOTOPMOST,
             0,
             0,
             0,
