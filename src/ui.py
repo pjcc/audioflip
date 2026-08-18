@@ -369,6 +369,7 @@ _MIN_VISIBLE_PX = 24          # a sliver this big on one screen counts as reacha
 _MIN_VISIBLE_FRACTION = 0.5   # otherwise at least half the widget must be on-screen
 _SCREEN_SETTLE_MS = 900       # debounce for a burst of display-change events
 _STARTUP_GRACE_SECONDS = 10.0  # let late monitors (DisplayPort, docks) arrive
+_DEVICE_REFRESH_DEBOUNCE_MS = 150  # coalesce bursts of COM device notifications
 
 
 def _rounded_mask(width: int, height: int, radius: int) -> QBitmap:
@@ -1420,6 +1421,11 @@ class AudioFlipWidget(QWidget):
         # Apply always-on-top from config
         self._apply_always_on_top(self._config_mgr.config.always_on_top)
 
+        # Coalesces bursts of COM device-change notifications
+        self._device_refresh_timer = QTimer(self)
+        self._device_refresh_timer.setSingleShot(True)
+        self._device_refresh_timer.timeout.connect(self._refresh_display)
+
         # Refresh timer (fallback polling every 2s for device changes)
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._refresh_display)
@@ -1734,8 +1740,20 @@ class AudioFlipWidget(QWidget):
         # If the user just toggled OFF the persistent bar, next fade will handle it
 
     def _on_device_change_com(self) -> None:
-        """Called from COM thread — schedule a Qt-safe refresh."""
-        QTimer.singleShot(0, self._refresh_display)
+        """Called from a COM thread — hand back to the Qt thread safely."""
+        # singleShot with a bound method of a main-thread QObject posts to
+        # that object's thread, so this is the safe hop across threads.
+        QTimer.singleShot(0, self._schedule_device_refresh)
+
+    def _schedule_device_refresh(self) -> None:
+        """Coalesce device-change notifications into one refresh.
+
+        Windows fires a burst of these during a Bluetooth connect or
+        disconnect, and each one previously triggered a full refresh. User
+        initiated switches still refresh immediately via _on_device_selected,
+        so this only delays reactions to external changes.
+        """
+        self._device_refresh_timer.start(_DEVICE_REFRESH_DEBOUNCE_MS)
 
     # --- Mouse interaction -------------------------------------------------
 
@@ -1925,16 +1943,24 @@ class AudioFlipWidget(QWidget):
         self._bt_active_device_id = None
 
         if dev_id:
+            # Bound up front: the auto-switch check below reads this, and
+            # relying on the two identical `if not ok` guards to keep them in
+            # step would break the moment either condition is edited.
+            matches: list[AudioDevice] = []
+
             # Try the stored ID first
             ok = self._audio_mgr.set_default_device(dev_id)
             if not ok and dev_name:
                 # ID is stale — find the new endpoint by name (BT-flagged first)
                 log.info("Old device ID failed, searching by name: '%s'", dev_name)
-                new_dev = self._find_bt_device_by_name(dev_name)
-                if not new_dev:
-                    # Broaden: search ALL devices by name (Dell/Intel may not
-                    # flag the endpoint as BT yet at 1.5s)
-                    new_dev = self._find_device_by_name(dev_name)
+                # One enumeration serves all three lookups below; this used to
+                # run three full enumerations back to back.
+                devices = self._audio_mgr.enumerate_devices()
+                matches = [d for d in devices if _bt_names_match(d.name, dev_name)]
+                # Prefer an endpoint actually flagged as Bluetooth, but fall
+                # back to any name match (Dell/Intel stacks may not flag it as
+                # BT yet at the 1.5s mark).
+                new_dev = next((d for d in matches if d.is_bluetooth), None) or next(iter(matches), None)
                 if new_dev:
                     log.info("Found new endpoint: '%s' (%s)", new_dev.name, new_dev.id)
                     ok = self._audio_mgr.set_default_device(new_dev.id)
@@ -1943,11 +1969,7 @@ class AudioFlipWidget(QWidget):
 
             # Check if Windows already switched the default (BT stack auto-switch)
             if not ok and dev_name:
-                devices = self._audio_mgr.enumerate_devices()
-                auto_switched = any(
-                    d.is_default and _bt_names_match(d.name, dev_name)
-                    for d in devices
-                )
+                auto_switched = any(d.is_default for d in matches)
                 if auto_switched:
                     log.info("Windows auto-switched default to '%s'", dev_name)
                     ok = True
@@ -2001,20 +2023,6 @@ class AudioFlipWidget(QWidget):
         self._refresh_display()
         if self._dropdown and self._dropdown.isVisible():
             self._dropdown.repopulate()
-
-    def _find_bt_device_by_name(self, name: str) -> AudioDevice | None:
-        """Find an active BT audio device whose name matches the given name."""
-        for dev in self._audio_mgr.enumerate_devices():
-            if dev.is_bluetooth and _bt_names_match(dev.name, name):
-                return dev
-        return None
-
-    def _find_device_by_name(self, name: str) -> AudioDevice | None:
-        """Find any active audio device whose name matches (BT or not)."""
-        for dev in self._audio_mgr.enumerate_devices():
-            if _bt_names_match(dev.name, name):
-                return dev
-        return None
 
     def _bt_cleanup(self) -> None:
         """Clean up the BT worker thread."""
@@ -2398,6 +2406,7 @@ class AudioFlipWidget(QWidget):
     def closeEvent(self, event: object) -> None:
         self._audio_mgr.unregister_change_callback()
         self._poll_timer.stop()
+        self._device_refresh_timer.stop()
         self._topmost_timer.stop()
         self._flash_timer.stop()
         if self._bt_thread and self._bt_thread.isRunning():
