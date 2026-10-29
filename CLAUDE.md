@@ -51,6 +51,8 @@ Uses the undocumented `IPolicyConfig` COM interface (CLSID `870af99c-171d-4f9e-a
 
 `get_default_device()` asks Windows for the default endpoint directly rather than enumerating everything and filtering - the widget polls it every 2s, so the full enumeration was several times the necessary COM work. `_read_device_props()` is shared with `enumerate_devices()` so the Bluetooth detection rules stay in one place.
 
+**Never `ctypes.cast()` a comtypes pointer - use `QueryInterface`.** `cast()` creates a second comtypes pointer over the single reference you were given, and both call `Release()` when collected. That was the cause of the long-unexplained crash: `get_default_volume()` cast an `IAudioEndpointVolume` on every 2s poll, freeing it while a pointer was still live, and `crash.log` recorded the access violation in `Release()` during garbage collection, every few days. Measured: after the cast pattern the refcount read `0xC0000001` (freed memory); with `QueryInterface` it stays exact over 500 cycles.
+
 Refresh is deliberately doubled up: an `IMMNotificationClient` COM callback plus a 2-second poll. The COM callback fires on a COM thread, so it must marshal to Qt via `QTimer.singleShot(0, ...)` - never touch widgets directly from it.
 
 ### The three problems most of the complexity exists to solve
