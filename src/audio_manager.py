@@ -14,7 +14,7 @@ from typing import Callable
 
 import comtypes
 from comtypes import GUID, HRESULT, COMMETHOD
-from ctypes import POINTER, c_uint, cast
+from ctypes import POINTER, c_uint
 from ctypes.wintypes import LPCWSTR, BOOL
 
 from pycaw.pycaw import (
@@ -361,14 +361,25 @@ class AudioManager:
         """Return the current default input device, or None."""
         return self.get_default_device(DeviceFlow.INPUT)
 
+    def _default_endpoint_volume(self, flow: DeviceFlow) -> IAudioEndpointVolume:
+        """Return IAudioEndpointVolume for the default endpoint of *flow*.
+
+        Must use QueryInterface, never ctypes.cast. cast() makes a second
+        comtypes pointer over the single reference Activate() returned, and
+        both call Release() when collected - one Release too many. That
+        freed the object while a pointer to it was still live, a
+        use-after-free on every 2s poll, and it is what crash.log captured:
+        an access violation in Release() during garbage collection.
+        """
+        edata = EDataFlow.eRender.value if flow == DeviceFlow.OUTPUT else EDataFlow.eCapture.value
+        dev = self._enumerator.GetDefaultAudioEndpoint(edata, ERole.eMultimedia.value)
+        interface = dev.Activate(IAudioEndpointVolume._iid_, _CLSCTX_ALL, None)
+        return interface.QueryInterface(IAudioEndpointVolume)
+
     def get_default_volume(self, flow: DeviceFlow = DeviceFlow.OUTPUT) -> float | None:
         """Get master volume scalar (0.0-1.0) of the default device."""
         try:
-            edata = EDataFlow.eRender.value if flow == DeviceFlow.OUTPUT else EDataFlow.eCapture.value
-            dev = self._enumerator.GetDefaultAudioEndpoint(edata, ERole.eMultimedia.value)
-            interface = dev.Activate(IAudioEndpointVolume._iid_, _CLSCTX_ALL, None)
-            vol = cast(interface, POINTER(IAudioEndpointVolume))
-            return vol.GetMasterVolumeLevelScalar()
+            return self._default_endpoint_volume(flow).GetMasterVolumeLevelScalar()
         except Exception as exc:
             log.warning("Failed to get volume: %s", exc)
             return None
@@ -377,11 +388,7 @@ class AudioManager:
         """Set master volume scalar (0.0-1.0) of the default device."""
         try:
             level = max(0.0, min(1.0, level))
-            edata = EDataFlow.eRender.value if flow == DeviceFlow.OUTPUT else EDataFlow.eCapture.value
-            dev = self._enumerator.GetDefaultAudioEndpoint(edata, ERole.eMultimedia.value)
-            interface = dev.Activate(IAudioEndpointVolume._iid_, _CLSCTX_ALL, None)
-            vol = cast(interface, POINTER(IAudioEndpointVolume))
-            vol.SetMasterVolumeLevelScalar(level, None)
+            self._default_endpoint_volume(flow).SetMasterVolumeLevelScalar(level, None)
             return True
         except Exception as exc:
             log.error("Failed to set volume: %s", exc)
