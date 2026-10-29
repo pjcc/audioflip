@@ -6,10 +6,8 @@ with user-overridable per-device assignments stored in config.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
-from functools import lru_cache
 
 from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor
