@@ -96,6 +96,10 @@ Two rules here are load-bearing, and both were previously bugs:
 
 The authoritative restore runs from `showEvent`, not `__init__`, because the widget's size is still a placeholder during construction and any geometry check there is computed against the wrong rectangle. Display changes are debounced through one settle timer, since docking emits a burst of events.
 
+### Single instance and build identification
+
+It is single-instance: a launch first connects to a per-user `QLocalServer` pipe, and if a running copy answers, that copy surfaces its widget and the new process exits. The startup log line names the binary and its build time (`audioflip starting (C:\...\audioflip.exe, built ...)`). Both exist because stray old builds were once launched from Start menu search and looked like the app had lost features - the log is the first place to check which copy ran. Old builds predate the pipe, so they are not caught by the guard.
+
 ## Packaging notes
 
 `audioflip.spec` needs `src.bluetooth` in `hiddenimports` because it is only reached through deferred imports inside functions. New modules imported the same way must be added there. `resources/*.svg` ships as `datas`, and `icons._resources_dir()` switches to `sys._MEIPASS` when frozen.
