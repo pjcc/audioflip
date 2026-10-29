@@ -102,3 +102,4 @@ Stored in `%APPDATA%\audioflip\config.json`:
 - **BT reconciliation** — matches BT device name inside endpoint friendly name, auto-migrates favourites/icons to new endpoint ID
 - **Logging** — `RotatingFileHandler` to `%APPDATA%\audioflip\audioflip.log`
 - **Crash diagnostics** — `faulthandler` writes every thread's stack to `%APPDATA%\audioflip\crash.log`. The build has no console, so a native crash (an access violation inside a `ctypes` or COM call) otherwise kills the app silently, leaving a log that just stops mid-sentence
+- **Single instance** — a second launch surfaces the running widget and exits; the log's startup line names the exact binary and its build time

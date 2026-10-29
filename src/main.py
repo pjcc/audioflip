@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import faulthandler
+import getpass
 import os
 import sys
 import logging
@@ -15,6 +16,7 @@ from logging.handlers import RotatingFileHandler
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QColor
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from .config import ConfigManager
 from .audio_manager import AudioManager
@@ -74,22 +76,83 @@ def _setup_crash_handler() -> None:
 
 log = logging.getLogger(__name__)
 
+# Named pipe the running instance listens on. Per user, since pipe names
+# are machine-wide.
+_INSTANCE_KEY = f"audioflip-{getpass.getuser()}"
+
+
+def _describe_build() -> str:
+    """Name the binary that is starting, for the log.
+
+    Several copies of audioflip.exe have existed on one machine at once,
+    and an old one launched from search looked like the app had lost
+    features. With this line the log says which copy ran.
+    """
+    if not getattr(sys, "frozen", False):
+        return "from source"
+    try:
+        built = datetime.datetime.fromtimestamp(os.path.getmtime(sys.executable))
+        return f"{sys.executable}, built {built:%Y-%m-%d %H:%M}"
+    except OSError:
+        return sys.executable
+
+
+def _hand_off_to_running_instance() -> bool:
+    """Ask an already-running audioflip to surface itself.
+
+    Returns True if one answered, in which case this process should exit
+    rather than start a second widget with its own timers and tray icon.
+    """
+    socket = QLocalSocket()
+    socket.connectToServer(_INSTANCE_KEY)
+    if not socket.waitForConnected(500):
+        return False
+    socket.disconnectFromServer()
+    return True
+
+
+def _listen_for_later_launches(widget: AudioFlipWidget) -> QLocalServer:
+    """Surface *widget* whenever another launch hands off to us.
+
+    Parented to the widget, so Qt keeps the listener alive for as long as
+    the widget exists.
+    """
+    server = QLocalServer(widget)
+    if not server.listen(_INSTANCE_KEY):
+        log.warning("Single-instance listener unavailable: %s", server.errorString())
+
+    def _on_connection() -> None:
+        conn = server.nextPendingConnection()
+        if conn is not None:
+            conn.disconnectFromServer()
+            conn.deleteLater()
+        log.info("Another launch handed off - surfacing the widget")
+        widget.surface()
+
+    server.newConnection.connect(_on_connection)
+    return server
+
 
 def main() -> int:
     """Launch the audioflip widget."""
     _setup_logging()
-    _setup_crash_handler()
-    log.info("audioflip starting")
 
     app = QApplication(sys.argv)
     app.setApplicationName("audioflip")
     app.setQuitOnLastWindowClosed(False)
+
+    if _hand_off_to_running_instance():
+        log.info("audioflip already running (%s) - surfaced it instead", _describe_build())
+        return 0
+    _setup_crash_handler()
+    log.info("audioflip starting (%s)", _describe_build())
 
     config_mgr = ConfigManager.instance()
     audio_mgr = AudioManager()
     icon_mgr = IconManager(tint_color=QColor("#e0e0e0"))
 
     widget = AudioFlipWidget(audio_mgr, icon_mgr, config_mgr)
+    _listen_for_later_launches(widget)
     widget.show()
 
     return app.exec()
