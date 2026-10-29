@@ -13,8 +13,37 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.audio_manager import _filter_path_from_device_id  # noqa: E402
 from src.icons import match_icon_for_name  # noqa: E402
 from src.ui import _bt_name_core, _bt_names_match  # noqa: E402
+
+# Real topology device IDs captured from a Buds Pro 2 and a Realtek card
+_A2DP_ID = (
+    "{2}.\\\\?\\bthenum#{0000110b-0000-1000-8000-00805f9b34fb}_vid&0001e000_pid&0500"
+    "#7&c600d85&0&fc915d65a039_c00000000#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\\src"
+)
+_HFP_ID = (
+    "{2}.\\\\?\\bthhfenum#bthhfpaudio#8&21fac373&0&97"
+    "#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\\wave"
+)
+_HDAUDIO_ID = (
+    "{2}.\\\\?\\hdaudio#func_01&ven_10ec&dev_0897&subsys_1462d812&rev_1001"
+    "#5&1e3c8a3f&0&0001#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\\eheadphonetopo"
+)
+
+
+def test_filter_path_strips_prefix_for_a2dp() -> None:
+    assert _filter_path_from_device_id(_A2DP_ID) == _A2DP_ID[len("{2}."):]
+
+
+def test_filter_path_accepts_hands_free() -> None:
+    assert _filter_path_from_device_id(_HFP_ID) == _HFP_ID[len("{2}."):]
+
+
+def test_filter_path_rejects_non_bluetooth() -> None:
+    # A Bluetooth request must never be sent to an ordinary sound card
+    assert _filter_path_from_device_id(_HDAUDIO_ID) is None
+    assert _filter_path_from_device_id("") is None
 
 
 def test_core_extracts_parenthesised_name() -> None:

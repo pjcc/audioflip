@@ -8,6 +8,7 @@ A compact, always-on-top Windows widget for switching audio devices and managing
 - Switch the system default audio device with one click
 - Favourite devices pinned to the top (right-click a device row to toggle)
 - Disconnected BT favourites stay visible as greyed-out ghost entries — click to connect
+- Headsets paired in Windows but not connected are listed the same way, favourite or not
 - Click the active BT device to disconnect
 
 **Right-click** opens a context menu:
@@ -58,7 +59,7 @@ python -m venv .venv
 .venv\Scripts\python.exe tests\test_name_matching.py
 ```
 
-Dependency-free — no pytest needed. They cover the pure logic where a wrong answer fails silently: fullscreen geometry (notably that a *maximised* window must not count as fullscreen), Bluetooth endpoint name matching, and icon keyword matching. Anything touching Win32, COM or Qt is verified by running the app.
+Dependency-free — no pytest needed. They cover the pure logic where a wrong answer fails silently: fullscreen geometry (notably that a *maximised* window must not count as fullscreen), Bluetooth endpoint name matching, Bluetooth filter-path parsing (so a Bluetooth request is never sent to an ordinary sound card), and icon keyword matching. Anything touching Win32, COM or Qt is verified by running the app.
 
 ## Building a Standalone .exe
 
@@ -98,7 +99,7 @@ Stored in `%APPDATA%\audioflip\config.json`:
 - **Change notifications** — `IMMNotificationClient` callback + 2s polling fallback
 - **Always-on-top** — `SetWindowPos(HWND_TOPMOST)` re-asserted every 500ms
 - **Fullscreen detection** — foreground window rect compared against the monitor's `rcMonitor` (not `rcWork`, so maximised windows don't count), plus `SHQueryUserNotificationState` for exclusive-mode D3D games
-- **Bluetooth** — `BluetoothSetServiceState` via `ctypes` for A2DP/HFP toggling; `BluetoothAuthenticateDeviceEx` for new-device pairing via SSP (background `QThread`). Falls back to `Enable-PnpDevice`/`Disable-PnpDevice` when the Win32 call fails — that fallback needs admin, and says so in the log when it doesn't have it
+- **Bluetooth** — connect and disconnect send `KSPROPERTY_ONESHOT_RECONNECT`/`_DISCONNECT` to the headset's Bluetooth audio kernel-streaming filter, the same request as the Settings app's Connect button; no admin needed, and the endpoint keeps its ID. The widget then waits up to 12s for the endpoint and reports failure if it never appears. Falls back to `BluetoothSetServiceState` (A2DP/HFP service toggling) for devices whose services are disabled, then to `Enable-PnpDevice`/`Disable-PnpDevice` for devices disabled in Device Manager — that last one needs admin, and says so in the log. `BluetoothAuthenticateDeviceEx` handles new-device pairing via SSP (background `QThread`)
 - **BT reconciliation** — matches BT device name inside endpoint friendly name, auto-migrates favourites/icons to new endpoint ID
 - **Logging** — `RotatingFileHandler` to `%APPDATA%\audioflip\audioflip.log`
 - **Crash diagnostics** — `faulthandler` writes every thread's stack to `%APPDATA%\audioflip\crash.log`. The build has no console, so a native crash (an access violation inside a `ctypes` or COM call) otherwise kills the app silently, leaving a log that just stops mid-sentence

@@ -14,7 +14,7 @@ from typing import Callable
 
 import comtypes
 from comtypes import GUID, HRESULT, COMMETHOD
-from ctypes import POINTER, c_uint
+from ctypes import POINTER, c_int, c_uint, c_wchar_p
 from ctypes.wintypes import LPCWSTR, BOOL
 
 from pycaw.pycaw import (
@@ -107,6 +107,51 @@ class IPolicyConfig(comtypes.IUnknown):
 class CPolicyConfigClient(comtypes.CoClass):
     _reg_clsid_ = GUID("{870af99c-171d-4f9e-af0d-e63df40c2bc9}")
     _com_interfaces_ = [IPolicyConfig]
+
+
+# ---------------------------------------------------------------------------
+# Device topology (devicetopology.h) - only the methods needed to find the
+# kernel streaming filter behind an endpoint. Vtable order must match the
+# header, so methods after the last one used are simply left off.
+# ---------------------------------------------------------------------------
+class IConnector(comtypes.IUnknown):
+    _iid_ = GUID("{9c2c4058-23f5-41de-877a-df3af236a09e}")
+
+
+IConnector._methods_ = [
+    COMMETHOD([], HRESULT, "GetType", (["out"], POINTER(c_int), "pType")),
+    COMMETHOD([], HRESULT, "GetDataFlow", (["out"], POINTER(c_int), "pFlow")),
+    COMMETHOD([], HRESULT, "ConnectTo", (["in"], POINTER(IConnector), "pConnectTo")),
+    COMMETHOD([], HRESULT, "Disconnect"),
+    COMMETHOD([], HRESULT, "IsConnected", (["out"], POINTER(BOOL), "pbConnected")),
+    COMMETHOD([], HRESULT, "GetConnectedTo", (["out"], POINTER(POINTER(IConnector)), "ppConTo")),
+    COMMETHOD([], HRESULT, "GetConnectorIdConnectedTo", (["out"], POINTER(c_wchar_p), "ppwstrConnectorId")),
+    COMMETHOD([], HRESULT, "GetDeviceIdConnectedTo", (["out"], POINTER(c_wchar_p), "ppwstrDeviceId")),
+]
+
+
+class IDeviceTopology(comtypes.IUnknown):
+    _iid_ = GUID("{2A07407E-6497-4A18-9787-32F79BD0D98F}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "GetConnectorCount", (["out"], POINTER(c_uint), "pCount")),
+        COMMETHOD([], HRESULT, "GetConnector", (["in"], c_uint, "nIndex"),
+                  (["out"], POINTER(POINTER(IConnector)), "ppConnector")),
+    ]
+
+
+def _filter_path_from_device_id(device_id: str) -> str | None:
+    """Turn a topology device ID into an openable Bluetooth KS filter path.
+
+    The ID looks like '{2}.\\\\?\\bthenum#...#{6994ad04-...}\\src': a
+    '{n}.' prefix, then a device interface path. Returns None for anything
+    that is not a Bluetooth audio filter, so ordinary sound cards never get
+    a Bluetooth request sent to them.
+    """
+    path = device_id.split(".", 1)[1] if device_id.startswith("{") else device_id
+    lower = path.lower()
+    if not lower.startswith("\\\\?\\") or not ("bthenum#" in lower or "bthhfenum#" in lower):
+        return None
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -345,14 +390,6 @@ class AudioManager:
                 pass
             self._callback = None
 
-    def get_output_devices(self) -> list[AudioDevice]:
-        """Convenience: return only output (render) devices."""
-        return [d for d in self.enumerate_devices() if d.flow == DeviceFlow.OUTPUT]
-
-    def get_input_devices(self) -> list[AudioDevice]:
-        """Convenience: return only input (capture) devices."""
-        return [d for d in self.enumerate_devices() if d.flow == DeviceFlow.INPUT]
-
     def get_default_output(self) -> AudioDevice | None:
         """Return the current default output device, or None."""
         return self.get_default_device(DeviceFlow.OUTPUT)
@@ -393,3 +430,45 @@ class AudioManager:
         except Exception as exc:
             log.error("Failed to set volume: %s", exc)
             return False
+
+    def bt_audio_filters(self) -> list[tuple[str, str, bool, str]]:
+        """Return (endpoint_id, name, is_active, filter_path) for BT render endpoints.
+
+        Covers connected and disconnected (unplugged) endpoints alike. The
+        filter path is the device interface of the Bluetooth audio kernel
+        streaming filter behind the endpoint, which is what
+        bluetooth.ks_oneshot() opens to ask Windows to connect or disconnect
+        the device - the same request the Settings app makes.
+
+        A2DP filters (BTHENUM) sort before hands-free ones (BTHHFENUM), so
+        callers taking the first match get the stereo profile.
+
+        Runs on the main thread: it is COM work, and keeping every COM
+        pointer on one thread is deliberate. Only the plain path string
+        crosses to the Bluetooth worker.
+        """
+        found: list[tuple[str, str, bool, str]] = []
+        try:
+            collection = self._enumerator.EnumAudioEndpoints(
+                EDataFlow.eRender.value,
+                DEVICE_STATE.ACTIVE.value | DEVICE_STATE.UNPLUGGED.value,
+            )
+            for i in range(collection.GetCount()):
+                try:
+                    dev = collection.Item(i)
+                    topology = dev.Activate(
+                        IDeviceTopology._iid_, _CLSCTX_ALL, None
+                    ).QueryInterface(IDeviceTopology)
+                    target = topology.GetConnector(0).GetDeviceIdConnectedTo()
+                except Exception:
+                    continue  # no topology: not a KS-backed endpoint
+                path = _filter_path_from_device_id(target)
+                if path is None:
+                    continue
+                name, _ = self._read_device_props(dev)
+                is_active = dev.GetState() == DEVICE_STATE.ACTIVE.value
+                found.append((dev.GetId(), name, is_active, path))
+        except Exception as exc:
+            log.warning("Bluetooth filter enumeration failed: %s", exc)
+        found.sort(key=lambda f: "bthenum#" not in f[3].lower())
+        return found

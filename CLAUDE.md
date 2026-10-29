@@ -24,7 +24,7 @@ Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 .venv\Scripts\python.exe tests\test_name_matching.py
 ```
 
-There is no linter or formatter configured, and test coverage is limited to pure functions - fullscreen geometry, Bluetooth endpoint name matching, icon keyword matching. Anything touching Win32, COM or Qt is verified manually: run the app and exercise the affected path.
+There is no linter or formatter configured, and test coverage is limited to pure functions - fullscreen geometry, Bluetooth endpoint name matching, Bluetooth filter-path parsing, icon keyword matching. Anything touching Win32, COM or Qt is verified manually: run the app and exercise the affected path.
 
 When a native crash happens the process dies silently, because the packaged build has no console. `faulthandler` writes the stack of every thread to `%APPDATA%\audioflip\crash.log` - check there first when the app vanishes and `audioflip.log` simply stops mid-sentence.
 
@@ -41,7 +41,7 @@ Windows-only PyQt6 desktop widget for switching the default audio device and dri
 
 - `config.py` - `ConfigManager` singleton over `config.json`. Every setter saves immediately; there is no dirty/flush model
 - `audio_manager.py` - Core Audio through `pycaw`/`comtypes`. Enumeration, default-device switching, volume, change callbacks
-- `bluetooth.py` - raw `ctypes` over `BluetoothApis.dll`. Discovery, SSP pairing, service enable/disable, plus a PowerShell PnP fallback. Module-level state (radio handle, paired-name cache, loaded DLL) is process-global
+- `bluetooth.py` - raw `ctypes`. KS one-shot connect/disconnect (`ks_oneshot()`), plus `BluetoothApis.dll` discovery, SSP pairing, service enable/disable, and a PowerShell PnP fallback. Module-level state (radio handle, paired-name cache, loaded DLL) is process-global
 - `icons.py` - SVG to tinted `QIcon`, keyword matching of device name to icon key
 - `ui.py` - widget, dropdown, device rows, context menu, BT scan dialog, tray icon, worker threads
 
@@ -59,9 +59,11 @@ Refresh is deliberately doubled up: an `IMMNotificationClient` COM callback plus
 
 **1. Bluetooth detection is unreliable.** The correct signal is `PKEY_Device_EnumeratorName` (pid 24) starting with `BTH`. Intel/Dell audio controllers proxy BT audio through their own driver and report `INTELAUDIO` instead, so `enumerate_devices()` falls back to matching the endpoint name against `get_paired_device_names()`. That list is cached for 30 seconds because enumeration is polled roughly once per second.
 
-**2. BT endpoint IDs change on reconnect.** A reconnecting BT device gets a new endpoint ID, which would orphan its favourite and icon override. `_bt_name_core()` extracts the device name from inside the last parentheses (`"Headphones (Buds Pro 2)"` gives `buds pro 2`); `DeviceDropdown.populate_and_show()` matches active BT devices against disconnected favourites on that core name and calls `migrate_favourite_id()`, which moves the ID across `favourites`, `favourite_devices`, and `icon_overrides` together. Any change to favourites or icon storage must keep those three in sync.
+**2. BT endpoint IDs used to change on reconnect.** The cause was the old connect mechanism: toggling A2DP/HFP services uninstalls and reinstalls the audio drivers, and the reinstalled endpoint gets a new ID, which would orphan its favourite and icon override. The KS path (problem 3) leaves the drivers alone, so IDs now stay stable, but favourites saved under a retired ID still need migrating. `_bt_name_core()` extracts the device name from inside the last parentheses (`"Headphones (Buds Pro 2)"` gives `buds pro 2`); `DeviceDropdown.populate_and_show()` matches active BT devices against disconnected favourites on that core name and calls `migrate_favourite_id()`, which moves the ID across `favourites`, `favourite_devices`, and `icon_overrides` together. Any change to favourites or icon storage must keep those three in sync.
 
-**3. BT connect is slow and stack-dependent.** Connect runs on a `QThread`, then a staged recovery follows: at 1.5 s try the stored ID, then BT-name match, then any-device name match, then check whether Windows auto-switched on its own; at 4 s a second retry catches slow stacks. Disconnect is the mirror image and calls `_switch_to_fallback()` *before* starting the BT work so audio moves to a non-BT device instantly. The timings are empirical, tuned against a Dell/Intel machine - do not tighten them casually.
+**3. BT connect has to actually request a connection.** `BluetoothSetServiceState(enable)` on a paired-but-disconnected headset returns `ERROR_INVALID_PARAMETER` (87) because the services are already enabled, and requests nothing - so for months, connecting a device already set up in Windows almost never worked. The primary path is now `ks_oneshot()`: `AudioManager.bt_audio_filters()` walks endpoint -> `IDeviceTopology` -> connector 0 -> the Bluetooth audio kernel-streaming filter's device path, and the worker opens it and sends `IOCTL_KS_PROPERTY` with `KSPROPSETID_BtAudio` / `KSPROPERTY_ONESHOT_RECONNECT` (or `_DISCONNECT`), the request behind the Settings app's Connect button. It works unelevated. `IPart::Activate(IKsControl)` returns `E_NOINTERFACE` on Windows 11 26300, which is why it is a raw IOCTL rather than `IKsControl`. Service toggling remains as a fallback for a device whose services were disabled (no filter exists then).
+
+The filter path is resolved on the main thread and only the string crosses to the `QThread` worker, so no COM pointer ever crosses threads. An accepted request does not mean connected: a headset that is off or out of range just never appears. So `_poll_bt_connect()` checks every 500 ms for the endpoint (stored ID first, then BT-name match) up to a 12 s deadline, switches the moment it appears, and shows 'Connection failed' at the deadline. This replaced fixed 1.5 s and 4 s guesses, which waited needlessly on fast stacks and reported nothing when a connect failed. Disconnect is the mirror image and calls `_switch_to_fallback()` *before* starting the BT work so audio moves to a non-BT device instantly.
 
 ### UI conventions worth knowing before editing `ui.py`
 
@@ -74,15 +76,16 @@ Refresh is deliberately doubled up: an `IMMNotificationClient` COM callback plus
 - `DeviceRow.mousePressEvent` calls `event.accept()` to stop clicks falling through the popup to windows behind it
 - Row click semantics: disconnected BT device connects, connected BT device *that is currently default* disconnects, anything else is a plain switch
 - Dropdown grow direction flips favourite ordering. When it grows upward, favourites render at the bottom so they stay nearest the cursor
-- Disconnected favourites are synthesised as `AudioDevice(is_connected=False)` ghost rows from cached config metadata, drawn at 40% icon opacity
+- Disconnected favourites are synthesised as `AudioDevice(is_connected=False)` ghost rows from cached config metadata, drawn at 40% icon opacity. Headsets paired in Windows but disconnected get ghost rows too, from `bt_audio_filters()` (A2DP filters only, deduplicated by BT name), so they can be connected without being favourited first
 - Themes are plain dicts of seven colour keys in `_THEMES`. Adding one means updating both `_THEMES` and `VALID_THEMES` in `config.py`
 
 ### The Bluetooth PowerShell fallback
 
-When `BluetoothSetServiceState` fails, `bluetooth.py` falls back to `Enable-PnpDevice`/`Disable-PnpDevice`. Two things to know:
+When both the KS request and `BluetoothSetServiceState` fail, `bluetooth.py` falls back to `Enable-PnpDevice`/`Disable-PnpDevice`. Three things to know:
 
 - it must be invoked with an argument list, never `shell=True`. The original built one command string routed through `cmd.exe`, which does not process backslash escapes, so `-Confirm:$false` arrived mangled and PowerShell rejected it as a string where a switch was required. The fallback therefore failed on argument binding every time, for months, while looking like it was trying
 - `Enable-PnpDevice` requires elevation, so this path still fails when audioflip runs unelevated - it now says so explicitly rather than failing obscurely
+- enabling is only attempted when the device is actually disabled (`ConfigManagerErrorCode` 22). `Enable-PnpDevice` on an enabled device exits 0 having done nothing, and that no-op was logged as 'BT connect via PowerShell succeeded' on every failed connect
 
 ### Position and screen handling
 

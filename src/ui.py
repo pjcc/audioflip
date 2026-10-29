@@ -11,7 +11,6 @@ import ctypes.wintypes
 import logging
 import os
 import time
-from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import (
     Qt,
@@ -33,14 +32,12 @@ from PyQt6.QtGui import (
     QColor,
     QCursor,
     QFont,
-    QIcon,
     QMouseEvent,
     QPainter,
     QPainterPath,
     QPaintEvent,
     QPen,
     QPixmap,
-    QRegion,
     QWheelEvent,
 )
 from PyQt6.QtWidgets import (
@@ -68,9 +65,6 @@ from .bluetooth import (
 )
 from .config import ConfigManager, VALID_THEMES
 from .icons import ICON_TYPES, IconManager, match_icon_for_name
-
-if TYPE_CHECKING:
-    pass
 
 log = logging.getLogger(__name__)
 
@@ -422,6 +416,10 @@ _MIN_VISIBLE_FRACTION = 0.5   # otherwise at least half the widget must be on-sc
 _SCREEN_SETTLE_MS = 900       # debounce for a burst of display-change events
 _STARTUP_GRACE_SECONDS = 10.0  # let late monitors (DisplayPort, docks) arrive
 _DEVICE_REFRESH_DEBOUNCE_MS = 150  # coalesce bursts of COM device notifications
+
+# --- Bluetooth connect ---
+_BT_CONNECT_POLL_MS = 500     # how often to look for the endpoint after a connect
+_BT_CONNECT_TIMEOUT_S = 12.0  # longer than any connect seen; past it, report failure
 
 
 def _rounded_mask(width: int, height: int, radius: int) -> QBitmap:
@@ -783,7 +781,25 @@ class DeviceDropdown(QWidget):
                 else:
                     log.debug("Skipping ghost for favourite %s (no metadata)", fav_id)
 
-        outputs = [d for d in devices if d.flow == DeviceFlow.OUTPUT]
+        # Headsets that are paired in Windows but not connected. Without
+        # these, a device could only be connected from here if it had been
+        # favourited while connected. A2DP filters only, so a headset does
+        # not appear twice under its hands-free name as well. Deduplicated
+        # against outputs only: a headset's microphone endpoint can outlive
+        # its headphones endpoint for a moment after a disconnect, and must
+        # not hide the row that reconnects it.
+        shown = {_bt_name_core(d.name) for d in devices if d.flow == DeviceFlow.OUTPUT}
+        for ep_id, name, is_active, path in self._audio_mgr.bt_audio_filters():
+            core = _bt_name_core(name)
+            if is_active or core in shown or "bthenum#" not in path.lower():
+                continue
+            shown.add(core)
+            devices.append(AudioDevice(
+                id=ep_id, name=name, flow=DeviceFlow.OUTPUT,
+                is_bluetooth=True, is_connected=False,
+            ))
+
+        outputs =[d for d in devices if d.flow == DeviceFlow.OUTPUT]
         inputs = [d for d in devices if d.flow == DeviceFlow.INPUT]
 
         # Pre-calculate size to determine grow direction
@@ -1086,20 +1102,26 @@ class _BodyWidget(QWidget):
 # _BluetoothWorker — runs BT connect/disconnect off the UI thread
 # ---------------------------------------------------------------------------
 class _BluetoothWorker(QObject):
-    """Performs Bluetooth connect/disconnect in a background thread."""
+    """Performs Bluetooth connect/disconnect in a background thread.
+
+    Deliberately COM-free: the filter path is resolved on the main thread
+    and only the string is handed over, so no COM pointer ever crosses
+    threads.
+    """
 
     finished = pyqtSignal(bool, str)  # success, action ("connect" or "disconnect")
 
-    def __init__(self, device_name: str, action: str) -> None:
+    def __init__(self, device_name: str, action: str, filter_path: str | None) -> None:
         super().__init__()
         self._device_name = device_name
         self._action = action  # "connect" or "disconnect"
+        self._filter_path = filter_path
 
     def run(self) -> None:
         if self._action == "connect":
-            ok = bluetooth_connect(self._device_name)
+            ok = bluetooth_connect(self._device_name, self._filter_path)
         else:
-            ok = bluetooth_disconnect(self._device_name)
+            ok = bluetooth_disconnect(self._device_name, self._filter_path)
         self.finished.emit(ok, self._action)
 
 
@@ -1413,7 +1435,10 @@ class AudioFlipWidget(QWidget):
         self._bt_pending_device_id: str | None = None  # old device ID (may be stale after reconnect)
         self._bt_pending_device_name: str | None = None  # device name for name-based fallback
         self._bt_active_device_id: str | None = None  # device ID the dropdown is showing status for
-        self._bt_retry_name: str | None = None  # kept for the 4s retry (not cleared by _set_pending)
+        self._bt_connect_deadline = 0.0  # monotonic time the post-connect wait gives up
+        self._bt_connect_started = 0.0
+        self._bt_connect_timer = QTimer(self)  # polls for the endpoint after a connect
+        self._bt_connect_timer.timeout.connect(self._poll_bt_connect)
         self._fullscreen_yielding = False  # True while demoted for a fullscreen app
         self._fullscreen_clear_ticks = 0
         self._fullscreen_hwnd = 0          # window we are currently sitting behind
@@ -1887,16 +1912,29 @@ class AudioFlipWidget(QWidget):
         else:
             log.warning("Failed to switch to device: %s", device.name)
 
-    def _bt_connect_and_switch(self, device: AudioDevice) -> None:
-        """Kick off BT connect in a background thread."""
-        if self._bt_thread is not None:
-            return  # already running a BT operation
-        self._bt_pending_device_id = device.id
-        self._bt_pending_device_name = device.name
-        self._bt_active_device_id = device.id
-        self._name_label.setText("Connecting\u2026")
+    def _bt_busy(self) -> bool:
+        """True while a BT operation or its post-connect wait is running."""
+        return self._bt_thread is not None or self._bt_connect_timer.isActive()
 
-        self._bt_worker = _BluetoothWorker(device.name, "connect")
+    def _bt_filter_path(self, device: AudioDevice) -> str | None:
+        """KS filter path for *device*: by endpoint ID, then by BT name.
+
+        The ID matches whenever the endpoint survived the last disconnect,
+        which the KS path guarantees. The name match covers favourites saved
+        under an ID that the old service-toggling disconnect retired.
+        """
+        filters = self._audio_mgr.bt_audio_filters()
+        match = next((f for f in filters if f[0] == device.id), None) or next(
+            (f for f in filters if _bt_names_match(f[1], device.name)), None
+        )
+        if match is None:
+            log.info("No BT audio filter found for '%s'", device.name)
+            return None
+        return match[3]
+
+    def _start_bt_worker(self, device: AudioDevice, action: str) -> None:
+        """Run a connect or disconnect on a background thread."""
+        self._bt_worker = _BluetoothWorker(device.name, action, self._bt_filter_path(device))
         self._bt_thread = QThread()
         self._bt_worker.moveToThread(self._bt_thread)
         self._bt_thread.started.connect(self._bt_worker.run)
@@ -1905,13 +1943,23 @@ class AudioFlipWidget(QWidget):
         self._bt_thread.finished.connect(self._bt_cleanup)
         self._bt_thread.start()
 
+    def _bt_connect_and_switch(self, device: AudioDevice) -> None:
+        """Kick off BT connect in a background thread."""
+        if self._bt_busy():
+            return  # already running a BT operation
+        self._bt_pending_device_id = device.id
+        self._bt_pending_device_name = device.name
+        self._bt_active_device_id = device.id
+        self._name_label.setText("Connecting\u2026")
+        self._start_bt_worker(device, "connect")
+
     def _bt_disconnect(self, device: AudioDevice) -> None:
         """Kick off BT disconnect in a background thread.
 
         Immediately switches audio to the best non-BT device so the user
         doesn't have to wait for the (potentially slow) BT disconnect.
         """
-        if self._bt_thread is not None:
+        if self._bt_busy():
             return
         self._bt_pending_device_id = None
         self._bt_pending_device_name = None
@@ -1921,15 +1969,7 @@ class AudioFlipWidget(QWidget):
         self._switch_to_fallback(device)
 
         self._name_label.setText("Disconnecting\u2026")
-
-        self._bt_worker = _BluetoothWorker(device.name, "disconnect")
-        self._bt_thread = QThread()
-        self._bt_worker.moveToThread(self._bt_thread)
-        self._bt_thread.started.connect(self._bt_worker.run)
-        self._bt_worker.finished.connect(self._on_bt_finished)
-        self._bt_worker.finished.connect(self._bt_thread.quit)
-        self._bt_thread.finished.connect(self._bt_cleanup)
-        self._bt_thread.start()
+        self._start_bt_worker(device, "disconnect")
 
     def _switch_to_fallback(self, bt_device: AudioDevice) -> None:
         """Immediately switch to the best non-BT device with the same flow.
@@ -1957,130 +1997,77 @@ class AudioFlipWidget(QWidget):
         """Handle BT worker completion (runs on main thread via signal)."""
         device_id = self._bt_active_device_id
 
-        # Update dropdown row status
-        if self._dropdown and self._dropdown.isVisible():
-            if action == "connect" and success:
-                self._dropdown.set_row_status(device_id or "", "Connected \u2014 switching\u2026")
-            elif not success:
-                # Show failure on dropdown, it will auto-close after 2s
-                self._dropdown.show_bt_result(device_id or "", False, action)
-
         if action == "connect" and success:
-            # Save device name for the 4s retry (survives _set_pending clearing)
-            self._bt_retry_name = self._bt_pending_device_name
-            # Wait for Windows to register the new endpoint, then switch
-            QTimer.singleShot(1500, self._set_pending_bt_device)
-            # Secondary refresh for slow BT stacks (e.g. Dell/Intel)
-            QTimer.singleShot(4000, self._delayed_bt_ui_refresh)
+            # Accepted is not connected - the device may be off or out of range
+            if self._dropdown and self._dropdown.isVisible():
+                self._dropdown.set_row_status(device_id or "", "Waiting for device\u2026")
+            self._bt_connect_deadline = time.monotonic() + _BT_CONNECT_TIMEOUT_S
+            self._bt_connect_started = time.monotonic()
+            self._bt_connect_timer.start(_BT_CONNECT_POLL_MS)
         elif action == "disconnect" and success:
             # Close dropdown and refresh after a brief pause
             if self._dropdown and self._dropdown.isVisible():
                 self._dropdown.show_bt_result(device_id or "", True, action)
             QTimer.singleShot(500, self._refresh_display)
         else:
-            # Failure — show "Failed" on widget label, refresh after a pause
-            fail_label = "Connect failed" if action == "connect" else "Disconnect failed"
-            self._name_label.setText(fail_label)
-            self._bt_pending_device_id = None
-            self._bt_pending_device_name = None
-            self._bt_active_device_id = None
-            self._bt_retry_name = None
-            QTimer.singleShot(2000, self._refresh_display)
+            self._finish_bt_failure(action)
 
-    def _set_pending_bt_device(self) -> None:
-        """Set the BT device as default after it has reconnected.
-
-        The old device ID may no longer exist (BT devices often get new
-        endpoint IDs on reconnect), so we fall back to name-based matching.
-        """
-        dev_id = self._bt_pending_device_id
-        dev_name = self._bt_pending_device_name
+    def _finish_bt_failure(self, action: str) -> None:
+        """Show a failed connect or disconnect, then settle back."""
+        fail_label = "Connect failed" if action == "connect" else "Disconnect failed"
+        self._name_label.setText(fail_label)
+        if self._dropdown and self._dropdown.isVisible():
+            self._dropdown.show_bt_result(self._bt_active_device_id or "", False, action)
         self._bt_pending_device_id = None
         self._bt_pending_device_name = None
-        dropdown_device_id = self._bt_active_device_id
         self._bt_active_device_id = None
+        QTimer.singleShot(2000, self._refresh_display)
 
-        if dev_id:
-            # Bound up front: the auto-switch check below reads this, and
-            # relying on the two identical `if not ok` guards to keep them in
-            # step would break the moment either condition is edited.
-            matches: list[AudioDevice] = []
+    def _poll_bt_connect(self) -> None:
+        """Switch to the BT device as soon as its endpoint is active.
 
-            # Try the stored ID first
-            ok = self._audio_mgr.set_default_device(dev_id)
-            if not ok and dev_name:
-                # ID is stale — find the new endpoint by name (BT-flagged first)
-                log.info("Old device ID failed, searching by name: '%s'", dev_name)
-                # One enumeration serves all three lookups below; this used to
-                # run three full enumerations back to back.
-                devices = self._audio_mgr.enumerate_devices()
-                matches = [d for d in devices if _bt_names_match(d.name, dev_name)]
-                # Prefer an endpoint actually flagged as Bluetooth, but fall
-                # back to any name match (Dell/Intel stacks may not flag it as
-                # BT yet at the 1.5s mark).
-                new_dev = next((d for d in matches if d.is_bluetooth), None) or next(iter(matches), None)
-                if new_dev:
-                    log.info("Found new endpoint: '%s' (%s)", new_dev.name, new_dev.id)
-                    ok = self._audio_mgr.set_default_device(new_dev.id)
-                else:
-                    log.warning("No active endpoint found matching '%s'", dev_name)
+        Replaces two fixed guesses (1.5s, then a 4s retry) that were tuned on
+        one machine: a fast stack waited needlessly, a slow one missed both,
+        and a headset that never connected failed silently. This switches the
+        moment the endpoint appears, and reports failure at the deadline.
 
-            # Check if Windows already switched the default (BT stack auto-switch)
-            if not ok and dev_name:
-                auto_switched = any(d.is_default for d in matches)
-                if auto_switched:
-                    log.info("Windows auto-switched default to '%s'", dev_name)
-                    ok = True
-
-            if ok:
-                if self._dropdown and self._dropdown.isVisible():
-                    self._dropdown.show_bt_result(dropdown_device_id or "", True, "connect")
-            else:
-                # Don't show failure — the 4s retry may still succeed
-                log.info("1.5s switch attempt inconclusive for '%s', 4s retry pending", dev_name)
-                if self._dropdown and self._dropdown.isVisible():
-                    self._dropdown.set_row_status(dropdown_device_id or "", "Switching\u2026")
-
-        self._refresh_display()
-
-    def _delayed_bt_ui_refresh(self) -> None:
-        """Secondary refresh for slow BT stacks (Dell/Intel).
-
-        Runs ~4s after BT connect to catch delayed endpoint registration.
-        If the BT device still isn't the default, re-attempt setting it.
+        The stored ID is tried first - the KS path keeps endpoint IDs stable -
+        then the BT name, for an endpoint the old service toggle re-created.
         """
-        retry_name = self._bt_retry_name
-        self._bt_retry_name = None
+        dev_id = self._bt_pending_device_id
+        dev_name = self._bt_pending_device_name or ""
+        devices = self._audio_mgr.enumerate_devices()
+        matches = [d for d in devices if _bt_names_match(d.name, dev_name)]
+        target = (
+            next((d for d in devices if d.id == dev_id), None)
+            or next((d for d in matches if d.is_bluetooth and d.flow == DeviceFlow.OUTPUT), None)
+            or next(iter(matches), None)
+        )
 
-        if retry_name:
-            # Check if the BT device is already the default (match by name
-            # only — don't require is_bluetooth since Dell/Intel stacks may
-            # not flag the endpoint as BT until the paired-device cache refreshes)
-            devices = self._audio_mgr.enumerate_devices()
-            already_default = any(
-                d.is_default and _bt_names_match(d.name, retry_name)
-                for d in devices
+        if target is None:
+            if time.monotonic() < self._bt_connect_deadline:
+                return
+            self._bt_connect_timer.stop()
+            log.warning(
+                "BT connect: '%s' did not appear within %.0fs - off, out of range, "
+                "or connected to another device", dev_name, _BT_CONNECT_TIMEOUT_S,
             )
-            if not already_default:
-                # Search ALL devices by name (not just those flagged as BT)
-                target = next(
-                    (d for d in devices if _bt_names_match(d.name, retry_name)),
-                    None,
-                )
-                if target:
-                    log.info(
-                        "4s retry: setting device as default: '%s' (%s)",
-                        target.name, target.id,
-                    )
-                    self._audio_mgr.set_default_device(target.id)
-                else:
-                    log.warning("4s retry: no endpoint found matching '%s'", retry_name)
-            else:
-                log.info("4s retry: '%s' is already the default", retry_name)
+            self._finish_bt_failure("connect")
+            return
 
-        self._refresh_display()
+        self._bt_connect_timer.stop()
+        log.info(
+            "BT connect: '%s' active after %.1fs, switching (%s)",
+            target.name, time.monotonic() - self._bt_connect_started, target.id,
+        )
+        if not target.is_default:
+            self._audio_mgr.set_default_device(target.id)
         if self._dropdown and self._dropdown.isVisible():
-            self._dropdown.repopulate()
+            self._dropdown.show_bt_result(self._bt_active_device_id or "", True, "connect")
+        self._bt_pending_device_id = None
+        self._bt_pending_device_name = None
+        self._bt_active_device_id = None
+        self._refresh_display()
 
     def _bt_cleanup(self) -> None:
         """Clean up the BT worker thread."""

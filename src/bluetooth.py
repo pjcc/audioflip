@@ -1,10 +1,17 @@
 """Windows Bluetooth API wrappers for connecting/disconnecting audio devices.
 
-Primary approach: Win32 BluetoothSetServiceState via BluetoothApis.dll
-with an explicit radio handle (required by some Intel/Dell BT stacks).
+Primary approach: a one-shot connect/disconnect request sent to the
+device's Bluetooth audio kernel streaming filter (KSPROPSETID_BtAudio).
+This is what the Settings app's Connect button does. It works unelevated,
+keeps the drivers installed, and so keeps the audio endpoint ID stable.
 
-Fallback: PowerShell Disable-PnpDevice / Enable-PnpDevice when the
-Win32 API fails (works across all BT controller vendors).
+Fallback: Win32 BluetoothSetServiceState via BluetoothApis.dll, for a
+device whose audio services are disabled (no filter exists to ask). It
+toggles the services, which reinstalls drivers - slow, and the reason
+Windows used to hand out a new endpoint ID on every reconnect.
+
+Last resort: PowerShell Enable-PnpDevice / Disable-PnpDevice, which needs
+elevation.
 
 Gracefully degrades if Bluetooth hardware is unavailable.
 """
@@ -28,6 +35,8 @@ from ctypes import (
     sizeof,
 )
 from ctypes.wintypes import BOOL, DWORD, ULONG, WORD
+
+from .config import _ps_quote
 
 log = logging.getLogger(__name__)
 
@@ -56,10 +65,28 @@ _A2DP_SINK = _make_guid(0x0000110B, 0x0000, 0x1000, b"\x80\x00\x00\x80\x5f\x9b\x
 # Hands-Free Profile (HFP): {0000111e-0000-1000-8000-00805f9b34fb}
 _HFP = _make_guid(0x0000111E, 0x0000, 0x1000, b"\x80\x00\x00\x80\x5f\x9b\x34\xfb")
 
-# Audio Source (A2DP Source): {0000110a-0000-1000-8000-00805f9b34fb}
-_A2DP_SOURCE = _make_guid(0x0000110A, 0x0000, 0x1000, b"\x80\x00\x00\x80\x5f\x9b\x34\xfb")
+# A2DP Source ({0000110a-...}) is deliberately absent: it is the profile of
+# a device that *sends* audio, such as a phone. Headphones never offer it, so
+# including it only produced an ERROR_SERVICE_DOES_NOT_EXIST (1060) warning
+# on every connect and disconnect.
+_AUDIO_SERVICE_GUIDS = [_A2DP_SINK, _HFP]
 
-_AUDIO_SERVICE_GUIDS = [_A2DP_SINK, _HFP, _A2DP_SOURCE]
+# ---------------------------------------------------------------------------
+# Kernel streaming one-shot connect/disconnect (ksmedia.h)
+# ---------------------------------------------------------------------------
+_KSPROPSETID_BT_AUDIO = _make_guid(0x7FA06C40, 0xB8F6, 0x4C7E, b"\x85\x56\xe8\xc3\x3a\x12\xe5\x4d")
+_KSPROPERTY_ONESHOT_RECONNECT = 0
+_KSPROPERTY_ONESHOT_DISCONNECT = 1
+_KSPROPERTY_TYPE_GET = 0x00000001
+_IOCTL_KS_PROPERTY = 0x002F0003  # CTL_CODE(FILE_DEVICE_KS, 0, METHOD_NEITHER, FILE_ANY_ACCESS)
+
+
+class _KSPROPERTY(ctypes.Structure):
+    _fields_ = [
+        ("Set", _GUID),
+        ("Id", ULONG),
+        ("Flags", ULONG),
+    ]
 
 # ---------------------------------------------------------------------------
 # Bluetooth structures
@@ -300,60 +327,62 @@ def get_paired_device_names() -> list[str]:
 # ---------------------------------------------------------------------------
 # Win32 API helpers
 # ---------------------------------------------------------------------------
-def _find_paired_devices() -> list[BLUETOOTH_DEVICE_INFO]:
-    """Enumerate all paired/remembered Bluetooth devices."""
+def _search_devices(
+    *, unknown: bool, inquiry: bool, timeout_multiplier: int = 0,
+) -> list[BLUETOOTH_DEVICE_INFO]:
+    """Run one BluetoothFindFirstDevice/FindNextDevice search.
+
+    Shared by the paired-device listing (no inquiry, instant) and the scan
+    dialog's discovery (active inquiry, several seconds).
+    """
     dll = _load_bt()
     if dll is None:
         return []
-
-    radio = _get_radio_handle()
 
     params = BLUETOOTH_DEVICE_SEARCH_PARAMS()
     params.dwSize = sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS)
     params.fReturnAuthenticated = True
     params.fReturnRemembered = True
-    params.fReturnUnknown = False
+    params.fReturnUnknown = unknown
     params.fReturnConnected = True
-    params.fIssueInquiry = False
-    params.cTimeoutMultiplier = 0
-    params.hRadio = radio  # explicit handle (or None → default)
-
-    device_info = BLUETOOTH_DEVICE_INFO()
-    device_info.dwSize = sizeof(BLUETOOTH_DEVICE_INFO)
+    params.fIssueInquiry = inquiry
+    params.cTimeoutMultiplier = timeout_multiplier  # ~1.28s per unit
+    params.hRadio = _get_radio_handle()  # explicit handle (or None → default)
 
     devices: list[BLUETOOTH_DEVICE_INFO] = []
-
+    info = BLUETOOTH_DEVICE_INFO()
+    info.dwSize = sizeof(BLUETOOTH_DEVICE_INFO)
     try:
-        h_find = dll.BluetoothFindFirstDevice(byref(params), byref(device_info))
+        h_find = dll.BluetoothFindFirstDevice(byref(params), byref(info))
     except Exception as exc:
         log.warning("BluetoothFindFirstDevice exception: %s", exc)
         return []
-
     if not h_find:
-        err = ctypes.get_last_error()
-        log.debug("BluetoothFindFirstDevice returned NULL (last error: %d)", err)
+        log.debug("BluetoothFindFirstDevice returned NULL (last error: %d)", ctypes.get_last_error())
         return []
 
-    log.debug("Found paired BT device: '%s' (connected=%s)", device_info.szName, bool(device_info.fConnected))
-    devices.append(_copy_device_info(device_info))
-
-    while True:
-        next_info = BLUETOOTH_DEVICE_INFO()
-        next_info.dwSize = sizeof(BLUETOOTH_DEVICE_INFO)
-        try:
-            found = dll.BluetoothFindNextDevice(h_find, byref(next_info))
-        except Exception:
-            break
-        if not found:
-            break
-        log.debug("Found paired BT device: '%s' (connected=%s)", next_info.szName, bool(next_info.fConnected))
-        devices.append(_copy_device_info(next_info))
-
     try:
-        dll.BluetoothFindDeviceClose(h_find)
-    except Exception:
-        pass
+        while True:
+            log.debug("Found BT device: '%s' (connected=%s)", info.szName, bool(info.fConnected))
+            devices.append(_copy_device_info(info))
+            info = BLUETOOTH_DEVICE_INFO()
+            info.dwSize = sizeof(BLUETOOTH_DEVICE_INFO)
+            try:
+                if not dll.BluetoothFindNextDevice(h_find, byref(info)):
+                    break
+            except Exception:
+                break
+    finally:
+        try:
+            dll.BluetoothFindDeviceClose(h_find)
+        except Exception:
+            pass
+    return devices
 
+
+def _find_paired_devices() -> list[BLUETOOTH_DEVICE_INFO]:
+    """Enumerate all paired/remembered Bluetooth devices."""
+    devices = _search_devices(unknown=False, inquiry=False)
     log.info("Enumerated %d paired Bluetooth devices", len(devices))
     return devices
 
@@ -383,57 +412,14 @@ def discover_audio_devices(timeout_multiplier: int = 4) -> list[dict]:
     remembered.  ``_device_info`` holds the raw BLUETOOTH_DEVICE_INFO
     struct for passing to ``pair_and_connect_device()``.
     """
-    dll = _load_bt()
-    if dll is None:
+    if _load_bt() is None:
         log.warning("discover_audio_devices: BT APIs not available")
         return []
 
-    radio = _get_radio_handle()
-
-    params = BLUETOOTH_DEVICE_SEARCH_PARAMS()
-    params.dwSize = sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS)
-    params.fReturnAuthenticated = True
-    params.fReturnRemembered = True
-    params.fReturnUnknown = True          # discover NEW devices
-    params.fReturnConnected = True
-    params.fIssueInquiry = True           # active scan
-    params.cTimeoutMultiplier = timeout_multiplier  # ~1.28s per unit
-    params.hRadio = radio
-
-    device_info = BLUETOOTH_DEVICE_INFO()
-    device_info.dwSize = sizeof(BLUETOOTH_DEVICE_INFO)
-
-    raw_devices: list[BLUETOOTH_DEVICE_INFO] = []
-
-    try:
-        h_find = dll.BluetoothFindFirstDevice(byref(params), byref(device_info))
-    except Exception as exc:
-        log.warning("discover_audio_devices: BluetoothFindFirstDevice exception: %s", exc)
-        return []
-
-    if not h_find:
-        err = ctypes.get_last_error()
-        log.info("discover_audio_devices: no devices found (last error: %d)", err)
-        return []
-
-    raw_devices.append(_copy_device_info(device_info))
-
-    while True:
-        next_info = BLUETOOTH_DEVICE_INFO()
-        next_info.dwSize = sizeof(BLUETOOTH_DEVICE_INFO)
-        try:
-            found = dll.BluetoothFindNextDevice(h_find, byref(next_info))
-        except Exception:
-            break
-        if not found:
-            break
-        raw_devices.append(_copy_device_info(next_info))
-
-    try:
-        dll.BluetoothFindDeviceClose(h_find)
-    except Exception:
-        pass
-
+    # fReturnUnknown + an active inquiry is what finds devices not yet paired
+    raw_devices = _search_devices(
+        unknown=True, inquiry=True, timeout_multiplier=timeout_multiplier,
+    )
     log.info("discover_audio_devices: found %d total devices", len(raw_devices))
 
     # Filter to Audio/Video major class
@@ -585,41 +571,86 @@ def _set_service_state(
         return False
 
 
-def _win32_connect(device_name: str) -> bool:
-    """Connect via Win32 BluetoothSetServiceState."""
+def _win32_set_services(device_name: str, enable: bool) -> bool:
+    """Enable or disable the audio services of a paired device by name.
+
+    Toggling services makes Windows install or remove the audio drivers.
+    Enabling a service that is already enabled is rejected with
+    ERROR_INVALID_PARAMETER (87) and requests no connection, so this only
+    helps a device whose services were previously disabled.
+    """
     dev = _match_device_by_name(device_name)
     if dev is None:
         return False
 
-    log.info("Win32: Connecting BT device '%s' (matched from '%s')", dev.szName, device_name)
+    log.info(
+        "Win32: %s services of '%s' (matched from '%s')",
+        "Enabling" if enable else "Disabling", dev.szName, device_name,
+    )
     success = False
     for guid in _AUDIO_SERVICE_GUIDS:
-        if _set_service_state(dev, guid, enable=True):
+        if _set_service_state(dev, guid, enable=enable):
             success = True
     return success
 
 
-def _win32_disconnect(device_name: str) -> bool:
-    """Disconnect via Win32 BluetoothSetServiceState."""
-    dev = _match_device_by_name(device_name)
-    if dev is None:
+def ks_oneshot(filter_path: str, connect: bool) -> bool:
+    """Ask Windows to connect or disconnect the device behind a BT audio filter.
+
+    *filter_path* comes from AudioManager.bt_audio_filters(). This sends
+    KSPROPERTY_ONESHOT_RECONNECT/DISCONNECT, the request behind the Settings
+    app's Connect and Disconnect buttons. It needs no elevation, works for a
+    paired device that is merely disconnected (where the service toggle does
+    nothing), and leaves the drivers installed, so the endpoint keeps its ID.
+
+    A True return means the request was accepted, not that the headset is
+    connected - a device that is off or out of range only shows that by
+    never turning up, which the widget's post-connect polling detects.
+    """
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.argtypes = [
+        ctypes.wintypes.LPCWSTR, DWORD, DWORD, c_void_p, DWORD, DWORD, ctypes.wintypes.HANDLE,
+    ]
+    k32.CreateFileW.restype = ctypes.wintypes.HANDLE
+    k32.DeviceIoControl.argtypes = [
+        ctypes.wintypes.HANDLE, DWORD, c_void_p, DWORD, c_void_p, DWORD, POINTER(DWORD), c_void_p,
+    ]
+    k32.DeviceIoControl.restype = BOOL
+    k32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+
+    action = "connect" if connect else "disconnect"
+    generic_rw = 0x80000000 | 0x40000000
+    share_rw = 0x1 | 0x2
+    open_existing = 3
+    handle = k32.CreateFileW(filter_path, generic_rw, share_rw, None, open_existing, 0, None)
+    if not handle or handle == ctypes.wintypes.HANDLE(-1).value:
+        log.warning("KS %s: cannot open filter (error %d): %s",
+                    action, ctypes.get_last_error(), filter_path)
         return False
-
-    log.info("Win32: Disconnecting BT device '%s' (matched from '%s')", dev.szName, device_name)
-    success = False
-    for guid in _AUDIO_SERVICE_GUIDS:
-        if _set_service_state(dev, guid, enable=False):
-            success = True
-    return success
+    try:
+        prop = _KSPROPERTY()
+        prop.Set = _KSPROPSETID_BT_AUDIO
+        prop.Id = _KSPROPERTY_ONESHOT_RECONNECT if connect else _KSPROPERTY_ONESHOT_DISCONNECT
+        prop.Flags = _KSPROPERTY_TYPE_GET
+        returned = DWORD()
+        started = time.monotonic()
+        ok = k32.DeviceIoControl(
+            handle, _IOCTL_KS_PROPERTY, byref(prop), sizeof(prop), None, 0, byref(returned), None,
+        )
+        elapsed_ms = (time.monotonic() - started) * 1000
+        if not ok:
+            log.warning("KS %s request failed (error %d) after %.0fms",
+                        action, ctypes.get_last_error(), elapsed_ms)
+            return False
+        log.info("KS %s request accepted in %.0fms", action, elapsed_ms)
+        return True
+    finally:
+        k32.CloseHandle(handle)
 
 
 # ---------------------------------------------------------------------------
 # PowerShell PnP fallback
 # ---------------------------------------------------------------------------
-def _ps_single_quote(value: str) -> str:
-    """Quote a value for a PowerShell single-quoted string literal."""
-    return "'" + str(value).replace("'", "''") + "'"
-
 
 def _run_powershell(script: str, timeout: int = 15) -> "subprocess.CompletedProcess | None":
     """Run a PowerShell snippet, returning None if it could not be launched.
@@ -650,7 +681,7 @@ def _pnp_set_enabled(instance_id: str, enable: bool) -> bool:
     """Enable or disable a PnP device via PowerShell."""
     verb = "Enable" if enable else "Disable"
     result = _run_powershell(
-        f"{verb}-PnpDevice -InstanceId {_ps_single_quote(instance_id)} "
+        f"{verb}-PnpDevice -InstanceId {_ps_quote(instance_id)} "
         f"-Confirm:$false -ErrorAction Stop"
     )
     if result is None:
@@ -671,8 +702,11 @@ def _pnp_set_enabled(instance_id: str, enable: bool) -> bool:
     return False
 
 
-def _find_bt_pnp_instance_id(device_name: str) -> str | None:
-    """Find the PnP instance ID for a Bluetooth device by name.
+_CM_PROB_DISABLED = 22  # ConfigManagerErrorCode of a device disabled in Device Manager
+
+
+def _find_bt_pnp_device(device_name: str) -> tuple[str, bool] | None:
+    """Find a Bluetooth PnP device by name: (instance_id, is_disabled).
 
     Uses Get-PnpDevice to list Bluetooth devices and matches by
     friendly name (case-insensitive substring).
@@ -680,7 +714,7 @@ def _find_bt_pnp_instance_id(device_name: str) -> str | None:
     name_lower = device_name.lower()
     result = _run_powershell(
         "Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue "
-        "| Select-Object InstanceId, FriendlyName, Status "
+        "| Select-Object InstanceId, FriendlyName, ConfigManagerErrorCode "
         "| ConvertTo-Json -Compress",
         timeout=10,
     )
@@ -707,95 +741,81 @@ def _find_bt_pnp_instance_id(device_name: str) -> str | None:
             continue
         if friendly in name_lower or name_lower in friendly:
             instance_id = dev.get("InstanceId", "")
-            log.info("PowerShell: Matched PnP device '%s' (InstanceId: %s)",
-                     dev.get("FriendlyName"), instance_id)
-            return instance_id
+            disabled = dev.get("ConfigManagerErrorCode") == _CM_PROB_DISABLED
+            log.info("PowerShell: Matched PnP device '%s' (InstanceId: %s, disabled=%s)",
+                     dev.get("FriendlyName"), instance_id, disabled)
+            return instance_id, disabled
 
     log.debug("PowerShell: No PnP device matched '%s'. Devices: %s",
               device_name, [d.get("FriendlyName") for d in data])
     return None
 
 
-def _powershell_enable(instance_id: str) -> bool:
-    """Enable a PnP device (reconnect) via PowerShell."""
-    return _pnp_set_enabled(instance_id, True)
+def _powershell_set_enabled(device_name: str, enable: bool) -> bool:
+    """Fallback: enable or disable a BT device via PowerShell PnP cmdlets.
 
-
-def _powershell_disable(instance_id: str) -> bool:
-    """Disable a PnP device (disconnect) via PowerShell."""
-    return _pnp_set_enabled(instance_id, False)
-
-
-def _powershell_connect(device_name: str) -> bool:
-    """Fallback: connect a BT device via PowerShell Enable-PnpDevice."""
-    instance_id = _find_bt_pnp_instance_id(device_name)
-    if not instance_id:
+    Enabling is only attempted for a device that is actually disabled.
+    Enable-PnpDevice on an enabled device exits 0 having done nothing, and
+    for months that no-op was logged as 'BT connect via PowerShell
+    succeeded' while the headset stayed disconnected.
+    """
+    found = _find_bt_pnp_device(device_name)
+    if found is None:
         log.info("PowerShell fallback: no PnP device found for '%s'", device_name)
         return False
-    return _powershell_enable(instance_id)
-
-
-def _powershell_disconnect(device_name: str) -> bool:
-    """Fallback: disconnect a BT device via PowerShell Disable-PnpDevice."""
-    instance_id = _find_bt_pnp_instance_id(device_name)
-    if not instance_id:
-        log.info("PowerShell fallback: no PnP device found for '%s'", device_name)
+    instance_id, disabled = found
+    if enable and not disabled:
+        log.info("PowerShell fallback: '%s' is not disabled, enabling it would do nothing",
+                 device_name)
         return False
-    return _powershell_disable(instance_id)
+    return _pnp_set_enabled(instance_id, enable)
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def bluetooth_connect(device_name: str) -> bool:
-    """Attempt to connect a Bluetooth audio device by name.
+def _bluetooth_set_connected(device_name: str, filter_path: str | None, connect: bool) -> bool:
+    """Connect or disconnect, trying each mechanism in order of preference."""
+    action = "connect" if connect else "disconnect"
 
-    1. Try Win32 BluetoothSetServiceState (with explicit radio handle).
-    2. If that fails, fall back to PowerShell Enable-PnpDevice.
-
-    Returns True if either method succeeded.
-    """
-    if not is_bluetooth_available():
-        log.warning("Bluetooth not available, cannot connect '%s'", device_name)
-        # Still try PowerShell — the Win32 DLL might be missing but
-        # PowerShell PnP can still work
-        log.info("Attempting PowerShell fallback for connect '%s'", device_name)
-        return _powershell_connect(device_name)
-
-    if _win32_connect(device_name):
-        log.info("BT connect via Win32 API succeeded for '%s'", device_name)
+    if filter_path and ks_oneshot(filter_path, connect):
+        log.info("BT %s via KS one-shot request succeeded for '%s'", action, device_name)
         return True
 
-    log.info("Win32 API failed for '%s', trying PowerShell fallback", device_name)
-    if _powershell_connect(device_name):
-        log.info("BT connect via PowerShell succeeded for '%s'", device_name)
+    if is_bluetooth_available():
+        if _win32_set_services(device_name, connect):
+            log.info("BT %s via service state succeeded for '%s'", action, device_name)
+            return True
+        log.info("Service state %s failed for '%s', trying PowerShell fallback", action, device_name)
+    else:
+        log.warning("Bluetooth APIs not available, trying PowerShell fallback for '%s'", device_name)
+
+    if _powershell_set_enabled(device_name, connect):
+        log.info("BT %s via PowerShell succeeded for '%s'", action, device_name)
         return True
 
-    log.warning("All BT connect methods failed for '%s'", device_name)
+    log.warning("All BT %s methods failed for '%s'", action, device_name)
     return False
 
 
-def bluetooth_disconnect(device_name: str) -> bool:
-    """Attempt to disconnect a Bluetooth audio device by name.
+def bluetooth_connect(device_name: str, filter_path: str | None = None) -> bool:
+    """Attempt to connect a Bluetooth audio device.
 
-    1. Try Win32 BluetoothSetServiceState (with explicit radio handle).
-    2. If that fails, fall back to PowerShell Disable-PnpDevice.
+    1. KS one-shot reconnect on *filter_path*, when the endpoint has one.
+    2. Win32 BluetoothSetServiceState, for a device whose services are off.
+    3. PowerShell Enable-PnpDevice, for a device disabled in Device Manager.
 
-    Returns True if either method succeeded.
+    Returns True if a method was accepted. Whether the device then actually
+    appears is for the caller to watch for.
     """
-    if not is_bluetooth_available():
-        log.warning("Bluetooth not available, cannot disconnect '%s'", device_name)
-        log.info("Attempting PowerShell fallback for disconnect '%s'", device_name)
-        return _powershell_disconnect(device_name)
+    return _bluetooth_set_connected(device_name, filter_path, connect=True)
 
-    if _win32_disconnect(device_name):
-        log.info("BT disconnect via Win32 API succeeded for '%s'", device_name)
-        return True
 
-    log.info("Win32 API failed for '%s', trying PowerShell fallback", device_name)
-    if _powershell_disconnect(device_name):
-        log.info("BT disconnect via PowerShell succeeded for '%s'", device_name)
-        return True
+def bluetooth_disconnect(device_name: str, filter_path: str | None = None) -> bool:
+    """Attempt to disconnect a Bluetooth audio device.
 
-    log.warning("All BT disconnect methods failed for '%s'", device_name)
-    return False
+    Same order as bluetooth_connect(). The KS request is preferred because
+    it leaves the device paired and its services enabled, so the next
+    connect can use the fast path again.
+    """
+    return _bluetooth_set_connected(device_name, filter_path, connect=False)
