@@ -1,42 +1,41 @@
 # AudioFlip
 
-A compact, always-on-top Windows widget for switching audio devices and managing Bluetooth audio.
+A small always-on-top Windows widget that shows your current audio device and switches it in one click, including connecting and disconnecting Bluetooth headphones.
 
-## Features
+![AudioFlip with its device dropdown open](docs/screenshot.png)
 
-**Left-click** opens a device dropdown:
-- Switch the system default audio device with one click
-- Favourite devices pinned to the top (right-click a device row to toggle)
-- Disconnected BT favourites stay visible as greyed-out ghost entries — click to connect
-- Headsets paired in Windows but not connected are listed the same way, favourite or not
-- Click the active BT device to disconnect
+## What it does
 
-**Right-click** opens a context menu:
-- Always on top — toggle `HWND_TOPMOST`
-- Yield to fullscreen apps — drop out of always-on-top while a fullscreen app (game, fullscreen video, presentation) is active on the same monitor
-- Flash on change — border flash animation on device switch
-- Show volume bar — persistent volume level bar on the widget
-- Show devices — output only / input only / both
-- Change icon — pick from 14 icon types for the current device
-- Theme — 10 colour themes: `dark` `light` `midnight` `ocean` `forest` `sunset` `berry` `slate` `copper` `arctic`
-- Start with windows — auto-launch on login
-- Move to screen — reposition widget to the active monitor
-- Scan for bluetooth — discover and pair new BT audio devices (opens a scan dialog, filters to audio devices, one-click SSP pairing)
+- **Switch output in one click** - left-click the widget, pick a device
+- **Connect Bluetooth headphones without opening Settings** - paired headsets appear greyed out when disconnected; click one to connect, click it again while it is active to disconnect
+- **Change volume by scrolling** over the widget, or over any of its menus
+- **Pin favourites** to the top of the list (right-click a device)
+- **Stays out of the way** - sits on top of the taskbar, and steps aside while a game or fullscreen video is running
+- **Pair new Bluetooth devices** from the widget itself
 
-**Scroll wheel** adjusts volume — works on the widget, and while the dropdown, context menu, or scan dialog are open.
+## Using it
 
-**Other:**
-- Draggable widget, position persisted between sessions
-- System tray icon with the same context menu
-- BT endpoint reconciliation — auto-migrates favourites/icons when Windows reassigns BT endpoint IDs on reconnect
-- Per-device icons auto-assigned by name, customisable via right-click menu
+| Action | Result |
+|--------|--------|
+| Left-click | Open the device list |
+| Right-click | Settings menu |
+| Scroll | Adjust volume |
+| Drag | Move the widget (position is remembered) |
 
-## Requirements
+The settings menu, also on the tray icon, covers:
 
-- Windows 10 or 11
-- Python 3.12+
+- Show output devices, input devices or both
+- Always on top, and yield to fullscreen apps
+- 10 colour themes
+- Volume bar, and a border flash when the device changes
+- Per-device icons (assigned automatically from the device name, changeable here)
+- Start with Windows
+- Move to screen, to bring the widget to the monitor you are on
+- Scan for Bluetooth devices
 
-## Setup
+## Install
+
+Requires Windows 10 or 11 and Python 3.12+.
 
 ```powershell
 git clone https://github.com/pjcc/audioflip.git
@@ -44,63 +43,32 @@ cd audioflip
 python -m venv .venv
 .venv\Scripts\python.exe -m ensurepip
 .venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m PyInstaller audioflip.spec
 ```
 
-## Running
+This builds a single portable `dist\audioflip.exe`. Run it, then turn on 'Start with Windows' from the right-click menu if you want it at login.
 
-```powershell
-.venv\Scripts\python.exe run.py
-```
+To run from source instead: `.venv\Scripts\python.exe run.py`
 
-## Tests
+## Troubleshooting
+
+Everything lives in `%APPDATA%\audioflip\`:
+
+- `config.json` - your settings, favourites and icon choices
+- `audioflip.log` - the first place to look when something does not work, including the exact build that started
+- `crash.log` - written if the app ever disappears without warning
+
+**A Bluetooth headset will not connect** - make sure it is on, in range and already paired in Windows. AudioFlip waits up to 12 seconds and shows 'Connection failed' if the headset never appears.
+
+**Features seem to be missing** - an older copy may have launched (for example from Start menu search). The startup line in `audioflip.log` names the exact binary.
+
+## Development
 
 ```powershell
 .venv\Scripts\python.exe tests\test_fullscreen.py
 .venv\Scripts\python.exe tests\test_name_matching.py
 ```
 
-Dependency-free — no pytest needed. They cover the pure logic where a wrong answer fails silently: fullscreen geometry (notably that a *maximised* window must not count as fullscreen), Bluetooth endpoint name matching, Bluetooth filter-path parsing (so a Bluetooth request is never sent to an ordinary sound card), and icon keyword matching. Anything touching Win32, COM or Qt is verified by running the app.
+The tests are dependency-free and cover the pure logic. Anything touching Win32, COM or Qt is checked by running the app. Delete `build` and `dist` before each PyInstaller build, as stale build output keeps old icons and resources.
 
-## Building a Standalone .exe
-
-```powershell
-Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
-.venv\Scripts\python.exe -m PyInstaller audioflip.spec
-```
-
-Output: `dist/audioflip.exe` — single portable executable.
-
-## Configuration
-
-Stored in `%APPDATA%\audioflip\config.json`:
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `always_on_top` | `true` | Keep widget above all windows |
-| `position` | `{x:100, y:100}` | Widget screen position |
-| `show_mode` | `"output"` | `"output"` / `"input"` / `"both"` |
-| `start_with_windows` | `false` | Auto-launch on login |
-| `theme` | `"dark"` | Colour theme |
-| `flash_on_change` | `true` | Flash border on device switch |
-| `show_volume_bar` | `false` | Persistent volume level bar |
-| `yield_to_fullscreen` | `true` | Drop topmost while a fullscreen app is active |
-| `icon_overrides` | `{}` | Per-device icon overrides (`device-id` → icon key) |
-| `favourites` | `[]` | Pinned device IDs |
-| `favourite_devices` | `{}` | Cached metadata for BT favourites |
-
-### Icon Keys
-
-`headphones` `earbuds` `speaker` `bluetooth` `monitor` `monitor2` `tv` `usb` `microphone` `camera` `soundbar` `mixer` `phone` `audio`
-
-## How It Works
-
-- **Device enumeration** — `pycaw` / `comtypes` via `IMMDeviceEnumerator`
-- **Device switching** — undocumented `IPolicyConfig` COM interface (`SetDefaultEndpoint`)
-- **Change notifications** — `IMMNotificationClient` callback + 2s polling fallback
-- **Always-on-top** — `SetWindowPos(HWND_TOPMOST)` re-asserted every 500ms
-- **Fullscreen detection** — foreground window rect compared against the monitor's `rcMonitor` (not `rcWork`, so maximised windows don't count), plus `SHQueryUserNotificationState` for exclusive-mode D3D games
-- **Bluetooth** — connect and disconnect send `KSPROPERTY_ONESHOT_RECONNECT`/`_DISCONNECT` to the headset's Bluetooth audio kernel-streaming filter, the same request as the Settings app's Connect button; no admin needed, and the endpoint keeps its ID. The widget then waits up to 12s for the endpoint and reports failure if it never appears. Falls back to `BluetoothSetServiceState` (A2DP/HFP service toggling) for devices whose services are disabled, then to `Enable-PnpDevice`/`Disable-PnpDevice` for devices disabled in Device Manager — that last one needs admin, and says so in the log. `BluetoothAuthenticateDeviceEx` handles new-device pairing via SSP (background `QThread`)
-- **BT reconciliation** — matches BT device name inside endpoint friendly name, auto-migrates favourites/icons to new endpoint ID
-- **Logging** — `RotatingFileHandler` to `%APPDATA%\audioflip\audioflip.log`
-- **Crash diagnostics** — `faulthandler` writes every thread's stack to `%APPDATA%\audioflip\crash.log`. The build has no console, so a native crash (an access violation inside a `ctypes` or COM call) otherwise kills the app silently, leaving a log that just stops mid-sentence
-- **Single instance** — a second launch surfaces the running widget and exits; the log's startup line names the exact binary and its build time
+Architecture and the reasoning behind the less obvious design choices are in [CLAUDE.md](CLAUDE.md).
